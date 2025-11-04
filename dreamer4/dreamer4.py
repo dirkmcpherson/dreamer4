@@ -1179,10 +1179,11 @@ def special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself = F
 
 def block_mask_special_tokens_right(
     seq_len,
-    num_tokens
+    num_tokens,
+    special_attend_only_itself = False
 ):
     def inner(b, h, q, k):
-        return special_token_mask(q, k, seq_len, num_tokens)
+        return special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself)
     return inner
 
 def compose_mask(mask1, mask2):
@@ -1228,7 +1229,7 @@ def get_attend_fn(
         block_mask_fn = block_mask_causal(causal_block_size) if causal else block_mask_noop
 
         if num_special_tokens > 0:
-            special_block_mask = block_mask_special_tokens_right(block_size_per_special, num_special_tokens, special_attend_only_itself)
+            special_block_mask = block_mask_special_tokens_right(block_size_per_special, num_special_tokens, special_attend_only_itself) # NOTE: ASK LR
             block_mask_fn = compose_mask(block_mask_fn, special_block_mask)
 
         block_mask = create_block_mask(block_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = k_seq_len)
@@ -1347,6 +1348,9 @@ class Attention(Module):
         # attention
 
         attend_fn = default(attend_fn, naive_attend)
+
+        # print out the shapes
+        # print(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
 
         out = attend_fn(q, k, v)
 
@@ -1493,7 +1497,10 @@ class AxialSpaceTimeTransformer(Module):
 
         # attend functions for space and time
 
-        use_flex = exists(flex_attention) and tokens.is_cuda
+        # use_flex = exists(flex_attention) and tokens.is_cuda # original
+        
+        has_kv_cache = exists(kv_cache)
+        use_flex = exists(flex_attention) and tokens.is_cuda and not has_kv_cache # KV cache shape breaks flex attention
 
         attend_kwargs = dict(use_flex = use_flex, softclamp_value = self.attn_softclamp_value, special_attend_only_itself = self.special_attend_only_itself, device = device)
 
@@ -1505,7 +1512,6 @@ class AxialSpaceTimeTransformer(Module):
 
         time_attn_kv_caches = []
 
-        has_kv_cache = exists(kv_cache)
 
         if has_kv_cache:
             past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
@@ -1543,7 +1549,8 @@ class AxialSpaceTimeTransformer(Module):
             maybe_kv_cache = next(iter_kv_cache, None) if layer_is_time else None
 
             # attention layer
-
+            # print the layer name
+            # print(f"Processing layer: {'Time' if layer_is_time else 'Space'} Attention")
             tokens, next_kv_cache = attn(
                 tokens,
                 rotary_pos_emb = layer_rotary_pos_emb,
@@ -1847,7 +1854,7 @@ class VideoTokenizer(Module):
 
         losses = (recon_loss, lpips_loss)
 
-        return total_loss, TokenizerLosses(losses)
+        return total_loss, TokenizerLosses(*losses)
 
 # dynamics model, axial space-time transformer
 
@@ -2104,7 +2111,7 @@ class DynamicsWorldModel(Module):
 
         self.ppo_eps_clip = ppo_eps_clip
         self.value_clip = value_clip
-        self.policy_entropy_weight = value_clip
+        self.policy_entropy_weight = policy_entropy_weight
 
         # pmpo related
 
@@ -2127,7 +2134,7 @@ class DynamicsWorldModel(Module):
         self.flow_loss_normalizer = LossNormalizer(1)
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len)
         self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_discrete_actions > 0 else None
-        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_discrete_actions > 0 else None
+        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_continuous_actions > 0 else None
 
         self.latent_flow_loss_weight = latent_flow_loss_weight
 
@@ -2252,9 +2259,11 @@ class DynamicsWorldModel(Module):
         if env_is_vectorized:
             video = rearrange(init_frame, 'b c vh vw -> b c 1 vh vw')
         else:
-            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
+            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw') # JS: weird that the channel gets moved here, but it must be more efficient.
 
         batch, device = video.shape[0], video.device
+
+        # print(f'Interacting with env for {max_timesteps} timesteps on device {device}. {self.video_tokenizer.device=}')
 
         # accumulate
 
@@ -2358,6 +2367,9 @@ class DynamicsWorldModel(Module):
             elif len(env_step_out) == 4:
                 next_frame, reward, terminated, truncated = env_step_out
 
+            elif len(env_step_out) == 5:
+                next_frame, reward, terminated, truncated, info = env_step_out
+
             # update episode lens
 
             episode_lens = torch.where(is_terminated, episode_lens, episode_lens + 1)
@@ -2425,11 +2437,14 @@ class DynamicsWorldModel(Module):
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
-        use_pmpo = True,
+        use_pmpo = False,
         normalize_advantages = None,
         eps = 1e-6
     ):
-        assert isinstance(experience, Experience)
+        # TOOD: move experience into a separate class so this assert can be written in a way that works
+        # assert isinstance(experience, Experience), f"`experience` must be of type Experience, got {type(experience)}"
+        assert type(experience).__name__ == "Experience" and type(experience).__module__.startswith("dreamer4")
+
 
         latents = experience.latents
         actions = experience.actions
@@ -3085,8 +3100,8 @@ class DynamicsWorldModel(Module):
         if latents.ndim == 4:
             latents = rearrange(latents, 'b t v d -> b t v 1 d') # 1 latent edge case
 
-        assert latents.shape[-2:] == self.latent_shape
-        assert latents.shape[2] == self.num_video_views
+        assert latents.shape[-2:] == self.latent_shape, f'latents must have shape {self.latent_shape}, got {latents.shape[-2:]}'
+        assert latents.shape[2] == self.num_video_views, f'latents must have {self.num_video_views} views, got {latents.shape[2]}'
 
         # variables
 

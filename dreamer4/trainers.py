@@ -7,7 +7,7 @@ from torch.optim import AdamW
 from torch.utils.data import Dataset, TensorDataset, DataLoader
 
 from accelerate import Accelerator
-
+import numpy as np
 from adam_atan2_pytorch import MuonAdamAtan2
 
 from dreamer4.dreamer4 import (
@@ -17,6 +17,7 @@ from dreamer4.dreamer4 import (
     combine_experiences
 )
 
+import matplotlib.pyplot as plt
 from ema_pytorch import EMA
 
 # helpers
@@ -103,12 +104,13 @@ class VideoTokenizerTrainer(Module):
         return self.accelerator.print(*args, **kwargs)
 
     def forward(
-        self
+        self, log_period=100
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
-        for _ in range(self.num_train_steps):
-            video = next(iter_train_dl)
+        losses = []
+        for i in range(self.num_train_steps):
+            video = next(iter_train_dl)[0] # added JS, might be dataset specific
 
             loss = self.model(video)
             self.accelerator.backward(loss)
@@ -119,7 +121,12 @@ class VideoTokenizerTrainer(Module):
             self.optim.step()
             self.optim.zero_grad()
 
-        self.print('training complete')
+            # if i % log_period == 0:
+            #     print(f"")
+            losses.append(loss.detach().item())
+
+        self.print(f'WM trained for {i} steps. mean loss {np.mean(losses)}')
+        return losses
 
 # dynamics world model
 
@@ -439,7 +446,7 @@ class SimTrainer(Module):
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
-        for epoch in range(self.epochs):
+        for _ in range(self.epochs):
 
             for (
                 latents,
@@ -482,6 +489,12 @@ class SimTrainer(Module):
                 )
 
                 policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
+
+                # all_losses = {
+                #     'policy_head_loss': policy_head_loss.item(),
+                #     'value_head_loss': value_head_loss.item(),
+                #     'model_loss': 
+                # }
 
                 self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
 
@@ -530,10 +543,111 @@ class SimTrainer(Module):
 
                 experiences.append(experience)
 
+            # print(f"collected experience of shape {experiences[0].video.shape}")
             combined_experiences = combine_experiences(experiences)
+
+
 
             self.learn(combined_experiences)
 
+            # print the summer total reward
+            total_reward = combined_experiences.rewards.sum().item()
+            self.print(f'total reward from collected experiences: {total_reward:.3f}')
+
             experiences.clear()
 
-        self.print('training complete')
+        # self.print(f'Trained for {_} episodes.')
+
+    @torch.no_grad()
+    def eval_episodes(
+        self,
+        env,
+        tokenizer,
+        num_episodes: int = 3,
+        max_steps: int | None = None,
+        env_is_vectorized: bool = False,
+        max_time_to_show: int = 8,
+        show=True,
+    ):
+        """
+        Run evaluation episodes with the current policy and visualize
+        original env frames vs reconstructed frames from the tokenizer.
+
+        tokenizer is expected to have:
+        - tokenize(video) -> latents
+        - decode(latents, height, width) -> recon_video
+        """
+        self.model.eval()
+        device = self.device
+
+        eval_exp = []
+        for ep in range(num_episodes):
+            # roll out one episode using the world model's current policy
+            exp: Experience = self.unwrapped_model.interact_with_env(
+                env,
+                env_is_vectorized=env_is_vectorized,
+                max_timesteps=max_steps,
+            )
+
+            if exp.video is None:
+                self.print("Experience has no raw video; skipping episode.")
+                continue
+
+            video = exp.video  # expected (b, c, t, h, w)
+            latents = exp.latents
+
+            # move to device / shapes
+            video = video.to(device)
+            latents = latents.to(device)
+
+            # decode latents back to video
+            b, c, t, h, w = video.shape
+            recon = tokenizer.decode(latents, height=h, width=w)
+
+            # bring to cpu for plotting
+            video_cpu = video[0].cpu()   # (c, t, h, w) first batch element
+            recon_cpu = recon[0].cpu()
+
+            # print the ranges for debugging
+            # self.print(f"Episode {ep}: original video range: {video_cpu.min().item():.3f} to {video_cpu.max().item():.3f}")
+            # self.print(f"Episode {ep}: recon video range: {recon_cpu.min().item():.3f} to {recon_cpu.max().item():.3f}")
+            eval_exp.append(exp)
+            
+            if show:
+                self._plot_episode_video(
+                    video_cpu,
+                    recon_cpu,
+                    episode_idx=ep,
+                    max_time_to_show=max_time_to_show,
+                )
+        return eval_exp
+
+    @staticmethod
+    def _plot_episode_video(
+        video: torch.Tensor,      # (c, t, h, w)
+        recon: torch.Tensor,      # (c, t, h, w)
+        episode_idx: int = 0,
+        max_time_to_show: int = 8,
+    ):
+        """
+        Side-by-side visualization for one episode:
+        top row = true frames, bottom row = reconstructions.
+        """
+        c, t, h, w = video.shape
+        t_show = min(t, max_time_to_show)
+
+        fig, axes = plt.subplots(2, t_show, figsize=(3 * t_show, 6))
+
+        for i in range(t_show):
+            # original
+            axes[0, i].imshow(video[:, i].permute(1, 2, 0).clamp(0, 1))
+            axes[0, i].set_title(f"ep {episode_idx} | orig t={i}")
+            axes[0, i].axis("off")
+
+            # reconstruction
+            axes[1, i].imshow(recon[:, i].permute(1, 2, 0).clamp(0, 1))
+            axes[1, i].set_title(f"ep {episode_idx} | recon t={i}")
+            axes[1, i].axis("off")
+
+        plt.tight_layout()
+        plt.show()
