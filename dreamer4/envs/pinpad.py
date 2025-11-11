@@ -175,7 +175,7 @@ class PinPad(gym.Env):
     if tuple(self.sequence) == self.target and not self.countdown:
       info = {'success': True}
       reward += 10.0
-      print(f"!!!!SUCCESS!!!")
+      # print(f"!!!!SUCCESS!!!")
       self.countdown = 4
     else:
       info = {'success': False}
@@ -190,7 +190,7 @@ class PinPad(gym.Env):
 
 
 
-    return obs, torch.tensor(reward, device=self.device), torch.tensor(self.done).to(self.device), False, info
+    return obs, torch.tensor(reward).to(self.device), torch.tensor(self.done).to(self.device), False, info
 
   def render(self):
     grid = np.zeros((16, 16, 3), np.uint8) + 255
@@ -336,33 +336,92 @@ LAYOUT_EIGHT = """
 ################
 """.strip('\n')
 
+import random
+class MotionPlannerPinPad():
+    def __init__(self, env):
+        assert env.task == 'three'
+        self.chosen_corner = random.choice([0,1,2])
+        self.action_space = env.action_space
+        self.actions = []
+
+
+    # move = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)][action]
+
+    def refresh_actions(self):
+        actions = []
+        optimal_actions = [1, 1, 1, 1, 1, 1, 1, 1, 4, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3]
+        while optimal_actions:
+          if random.random() > 0.5:
+            actions.append(self.action_space.sample())
+          else:
+            actions.append(optimal_actions.pop(0))
+        self.actions = actions
+
+    def sample(self):
+        if not self.actions:
+            self.refresh_actions()
+
+        return self.actions.pop()
+
 if __name__ == '__main__':
+  import argparse
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--user", action="store_true")
+  parser.add_argument("--mp", action="store_true")
+  parser.add_argument("--vis", action="store_true")
+  parser.add_argument("-n", "--num_eps", type=int, default=100)
+
+  args = parser.parse_args()
+
+  import random
   import time
   import cv2
-  l = 2000
-  env = PinPad('three', length=l)
+  neps = 100
+  env = PinPad('three', length=100)
+
+  if args.mp:
+    print(f"Using motion planning algorithm.")
+  elif args.user:
+    print("User determining actions.")
+  else:
+    print(f"Random actions.")
+
+  mp = MotionPlannerPinPad(env)
+
   env.reset()
-  total_r = 0.0
-  for steps in range(l):
+  total_r = 0.0; total_eps = 0
+  while total_eps < neps:
     img = env.render()
-    cv2.imshow("pinpad", img)
-    key = cv2.waitKey(0)
-    if key == ord('w'):
-      cmd = 2
-    elif key == ord('s'):
-      cmd = 1
-    elif key == ord('a'):
-      cmd = 4
-    elif key == ord('d'):
-      cmd = 3
-    elif key == ord('q'):
-      break
+
+    if args.vis:
+      cv2.imshow("pinpad", img)
+      cv2.waitKey(100)
+
+    if args.user:
+      key = cv2.waitKey(0)
+      if key == ord('w'):
+        cmd = 2
+      elif key == ord('s'):
+        cmd = 1
+      elif key == ord('a'):
+        cmd = 4
+      elif key == ord('d'):
+        cmd = 3
+      elif key == ord('q'):
+        break
+      else:
+        cmd = 0
+    elif args.mp:
+      cmd = mp.sample()
     else:
-      cmd = 0
+      cmd = env.action_space.sample()
     # env.step(env.action_space.sample())
     _, r, done, *other = env.step(cmd)
     total_r += r
     if done:
-      print(f"total {total_r}")
-      break
-    print(f"step {steps} reward {r} done {done}")
+      # print(f"Ep {total_eps} {total_r}")
+      total_eps += 1
+      env.reset()
+
+    # print(f"step {steps} reward {r} done {done}")
+  print(f"Average reward for {neps} episodes. {total_r/neps:+1.2f}")

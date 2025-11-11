@@ -2,7 +2,7 @@
 
 # %% auto 0
 __all__ = ['to_device', 'make_tiny_dataloader', 'batchify_video', 'TinyOverfitConfig', 'train_tiny_overfit', 'plot_losses',
-           'WrappedEnv', 'MotionPlannerPinPad', 'build_tiny_pinpad_dataset']
+           'WrappedEnv', 'build_tiny_pinpad_dataset']
 
 # %% ../nbs/00_core.ipynb 2
 from dataclasses import dataclass
@@ -142,7 +142,8 @@ def plot_losses(losses: Sequence[dict], keys=("total", "recon", "lpips")):
 
 
 # %% ../nbs/00_core.ipynb 6
-from .envs.pinpad import PinPad
+from .envs.pinpad import PinPad, MotionPlannerPinPad
+import random
 
 # wrap the env to return float32 images between 0 and 1
 class WrappedEnv:
@@ -161,59 +162,39 @@ class WrappedEnv:
         obs = obs / 255.0
         return obs, reward, done, trunc, info
 
-import random
-class MotionPlannerPinPad():
-    def __init__(self, env):
-        assert env.task == 'three'
-        self.chosen_corner = random.choice([0,1,2])
-        self.actions = []
-
-
-    # move = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)][action]
-
-    def refresh_actions(self):
-        self.chosen_corner = random.choice([0,1,2])
-        if self.chosen_corner == 0:
-            actions = [1, 1, 3, 3, 1, 1, 3, 1, 3, 1, 3]
-        elif self.chosen_corner == 1:
-            actions = [2, 2, 4, 4, 2, 2, 4, 2, 4, 2, 4]
-        elif self.chosen_corner == 2:
-            actions = [2, 2, 3, 3, 2, 2, 2, 4, 4, 4, 4]
-        else: raise ValueError
-        self.actions = actions
-
-
-    def sample(self):
-        if not self.actions:
-            self.refresh_actions()
-
-        return self.actions.pop()
-
 import cv2
 def build_tiny_pinpad_dataset(device='cuda', n=1024, episode_length=8):
     env = PinPad('three', length=episode_length, extra_obs=False, size=[64, 64], random_starting_pos=True, device=device)
-    # mp = MotionPlannerPinPad(env)
+    mp = MotionPlannerPinPad(env)
     env = WrappedEnv(env)
     obs = env.reset()
     # print the obs stats
     # make a tiny dataset
     eps_containing_success = 0; eps = 0
     ep_contained_success = False
-    videos = []; curr_video = []
-    for _ in range(n - 1):
+    videos = []; curr_video = []; total_reward = 0; ep_reward = 0
+    while True:
         curr_video.append(obs)
-        action = env.action_space.sample() # if random.random() > 0.5 else mp.sample()
-        obs, reward, done, terminated, info = env.step(action)
+        action = mp.sample()
+        obs, reward, done, terminated, info = env.step(action); ep_reward += reward
 
         ep_contained_success = info['success'] or ep_contained_success
         if done or terminated:
-            eps += 1
-            eps_containing_success += 1 if ep_contained_success else 0
-            ep_contained_success = False
+            if ep_contained_success or random.random() > 0.5: # don't take it sometimes, HACK to get a higher success rate in the base dataset
+                eps_containing_success += 1 if ep_contained_success else 0
+                eps += 1
+                videos.append(torch.stack(curr_video))
+                total_reward += ep_reward
 
-            videos.append(torch.stack(curr_video))
-            curr_video = []
+            # unallocate all the memory in curr_video
+            del curr_video
+
+            curr_video = []; ep_reward = 0
+            ep_contained_success = False
             obs = env.reset()
+
+        if eps >= n:
+            break
 
 
     videos = torch.stack(videos)  # (n, t, c, h, w)
