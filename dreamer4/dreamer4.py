@@ -3172,7 +3172,8 @@ class DynamicsWorldModel(Module):
                 step_sizes_log2 = randint(1, self.num_step_sizes_log2, (batch,), device = device)
                 num_step_sizes = 2 ** step_sizes_log2
 
-                signal_levels = randint(0, self.max_steps, (batch, time)) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                signal_levels = randint(0, self.max_steps, (batch, time), device=device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+
 
         # times is from 0 to 1
 
