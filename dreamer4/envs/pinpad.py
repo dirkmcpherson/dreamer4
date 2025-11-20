@@ -161,6 +161,7 @@ class PinPad(gym.Env):
     reward = 0.0
     # move = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)][action]
     move = [(0, 0), (0, 2), (0, -2), (2, 0), (-2, 0)][action]
+
     # print(f"pinpad move {move}")
     x = np.clip(self.player[0] + move[0], 0, 15)
     y = np.clip(self.player[1] + move[1], 0, 13)
