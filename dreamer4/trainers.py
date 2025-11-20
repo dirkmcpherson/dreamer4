@@ -110,7 +110,9 @@ class VideoTokenizerTrainer(Module):
 
         losses = []
         for i in range(self.num_train_steps):
-            video = next(iter_train_dl)[0] # added JS, might be dataset specific
+            # robust to both TensorDataset and bare-tensor datasets
+            batch = next(iter_train_dl)
+            video = batch[0] if isinstance(batch, (tuple, list)) else batch
 
             loss = self.model(video)
             self.accelerator.backward(loss)
