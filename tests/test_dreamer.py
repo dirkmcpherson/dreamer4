@@ -15,7 +15,8 @@ def exists(v):
 @param('condition_on_actions', (False, True))
 @param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
-@param('use_time_kv_cache', (False, True))
+@param('add_state_pred_head', (False, True))
+@param('use_time_cache', (False, True))
 @param('var_len', (False, True))
 def test_e2e(
     pred_orig_latent,
@@ -28,7 +29,8 @@ def test_e2e(
     condition_on_actions,
     num_residual_streams,
     add_reward_embed_to_agent_token,
-    use_time_kv_cache,
+    add_state_pred_head,
+    use_time_cache,
     var_len
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
@@ -41,7 +43,9 @@ def test_e2e(
         patch_size = 32,
         attn_dim_head = 16,
         num_latent_tokens = 4,
-        num_residual_streams = num_residual_streams
+        num_residual_streams = num_residual_streams,
+        encoder_add_decor_aux_loss = True,
+        decorr_sample_frac = 1.
     )
 
     video = torch.randn(2, 3, 4, 256, 256)
@@ -69,12 +73,13 @@ def test_e2e(
         pred_orig_latent = pred_orig_latent,
         num_discrete_actions = 4,
         attn_dim_head = 16,
+        attn_heads = heads,
         attn_kwargs = dict(
-            heads = heads,
             query_heads = query_heads,
         ),
         prob_no_shortcut_train = prob_no_shortcut_train,
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
+        add_state_pred_head = add_state_pred_head,
         num_residual_streams = num_residual_streams
     )
 
@@ -121,7 +126,7 @@ def test_e2e(
         image_width = 128,
         batch_size = 2,
         return_rewards_per_frame = True,
-        use_time_kv_cache = use_time_kv_cache
+        use_time_cache = use_time_cache
     )
 
     assert generations.video.shape == (2, 3, 10, 128, 128)
@@ -615,9 +620,9 @@ def test_cache_generate():
         num_residual_streams = 1
     )
 
-    generated, time_kv_cache = dynamics.generate(1, return_time_kv_cache = True)
-    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
-    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
+    generated, time_cache = dynamics.generate(1, return_time_cache = True)
+    generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
+    generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
 @param('vectorized', (False, True))
 @param('use_pmpo', (False, True))
@@ -641,7 +646,9 @@ def test_online_rl(
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
-        num_latent_tokens = 1
+        num_latent_tokens = 1,
+        image_height = 256,
+        image_width = 256,
     )
 
     world_model_and_policy = DynamicsWorldModel(
@@ -675,10 +682,18 @@ def test_online_rl(
 
     # manually
 
+    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_for_policy_optimization = True)
+
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
 
-    combined_experience = combine_experiences([one_experience, another_experience])
+    combined_experience = combine_experiences([dream_experience, one_experience, another_experience])
+
+    # quick test moving the experience to different devices
+
+    if torch.cuda.is_available():
+        combined_experience = combined_experience.to(torch.device('cuda'))
+        combined_experience = combined_experience.to(world_model_and_policy.device)
 
     if store_agent_embed:
         assert exists(combined_experience.agent_embed)
@@ -795,3 +810,22 @@ def test_epo():
 
     fitness = torch.randn(16,)
     dynamics.evolve_(fitness)
+
+def test_images_to_video_tokenizer():
+    import torch
+    from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer
+
+    tokenizer = VideoTokenizer(
+        dim = 512,
+        dim_latent = 32,
+        patch_size = 32,
+        image_height = 256,
+        image_width = 256,
+        encoder_add_decor_aux_loss = True
+    )
+
+    images = torch.randn(2, 3, 256, 256)
+    loss, (losses, recon_images) = tokenizer(images, return_intermediates = True)
+    loss.backward()
+
+    assert images.shape == recon_images.shape

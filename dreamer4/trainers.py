@@ -543,7 +543,7 @@ class SimTrainer(Module):
 
                 total_experience += num_experience
 
-                experiences.append(experience)
+                experiences.append(experience.cpu())
 
             # print(f"collected experience of shape {experiences[0].video.shape}")
             combined_experiences = combine_experiences(experiences)

@@ -1,7 +1,8 @@
 __version__ = "0.0.1"
 from dreamer4.dreamer4 import (
     VideoTokenizer,
-    DynamicsWorldModel
+    DynamicsWorldModel,
+    AxialSpaceTimeTransformer
 )
 
 
