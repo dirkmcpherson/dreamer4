@@ -8,4 +8,4 @@ import torch
 import matplotlib.pyplot as plt
 from ._core import build_tiny_pinpad_dataset, make_tiny_dataloader
 from .dreamer4 import VideoTokenizer, DynamicsWorldModel
-from .trainers import VideoTokenizerTrainer, SimTrainer, cycle
+from .trainers import VideoTokenizerTrainer, SimTrainer, cycle, BehaviorCloneTrainer
