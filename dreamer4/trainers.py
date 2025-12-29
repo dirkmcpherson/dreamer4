@@ -67,6 +67,7 @@ class VideoTokenizerTrainer(Module):
             weight_decay = weight_decay
         )
 
+
         if optim_klass is MuonAdamAtan2:
             optim = MuonAdamAtan2(
                 model.muon_parameters(),
@@ -83,7 +84,7 @@ class VideoTokenizerTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
 
-        self.num_train_steps = num_train_steps
+        self.num_train_steps = num_train_steps; self.total_steps = 0
         self.batch_size = batch_size
 
         (
@@ -126,8 +127,9 @@ class VideoTokenizerTrainer(Module):
             # if i % log_period == 0:
             #     print(f"")
             losses.append(loss.detach().item())
+            self.total_steps += 1
 
-        self.print(f'WM trained for {i} steps. mean loss {np.mean(losses)}')
+        self.print(f'WM trained for {i} steps w/ mean loss {np.mean(losses)}. Total steps: {self.total_steps}.')
         return losses
 
 # dynamics world model
@@ -180,7 +182,7 @@ class BehaviorCloneTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
 
-        self.num_train_steps = num_train_steps
+        self.num_train_steps = num_train_steps; self.total_updates = 0
         self.batch_size = batch_size
 
         (
@@ -224,7 +226,9 @@ class BehaviorCloneTrainer(Module):
             self.optim.step()
             self.optim.zero_grad()
 
-        self.print('training complete')
+            self.total_updates += 1
+
+        self.print(f'Trained for {self.num_train_steps} updates. New total: {self.total_updates}.')
 
 # training from dreams
 
@@ -262,7 +266,7 @@ class DreamTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
 
-        self.num_train_steps = num_train_steps
+        self.num_train_steps = num_train_steps; self.total_updates = 0
         self.batch_size = batch_size
         self.generate_timesteps = generate_timesteps
 
@@ -326,8 +330,9 @@ class DreamTrainer(Module):
 
             self.value_head_optim.step()
             self.value_head_optim.zero_grad()
+            self.total_updates += 1
 
-        self.print('training complete')
+        self.print(f'Trained for {self.num_train_steps} updates. New total: {self.total_updates}.')
 
 # training from sim
 

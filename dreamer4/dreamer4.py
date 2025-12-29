@@ -1397,20 +1397,23 @@ class Attention(Module):
         k = self.k_heads_rmsnorm(k)
 
         # rotary
-
         if exists(rotary_pos_emb):
             q = apply_rotations(rotary_pos_emb, q)
             k = apply_rotations(rotary_pos_emb, k)
 
         # caching
-
         if exists(kv_cache):
             ck, cv = kv_cache
             k = cat((ck, k), dim = -2)
             v = cat((cv, v), dim = -2)
 
-        # attention
+        # Force uniformity for flex_attention (fix for AMP/Rotary mismatch)
+        if q.dtype != k.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
 
+        # attention
         attend_fn = default(attend_fn, naive_attend)
 
         # print out the shapes
@@ -1509,9 +1512,10 @@ class AxialSpaceTimeTransformer(Module):
         num_residual_streams = 1,
         num_special_spatial_tokens = 1,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
+        restrict_time_attention_to_special=False, # restrict time attention to only special tokens (latents / agents)
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
-        rnn_time = True
+        rnn_time = True,
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
@@ -1527,6 +1531,7 @@ class AxialSpaceTimeTransformer(Module):
         # attention masking
 
         self.special_attend_only_itself = special_attend_only_itself
+        self.restrict_time_attention_to_special = restrict_time_attention_to_special
 
         # time rotary embedding
 
@@ -2525,13 +2530,13 @@ class DynamicsWorldModel(Module):
         while not is_terminated.all():
             step_index += 1
 
-            latents = self.video_tokenizer(video, return_latents = True)
+            latents = self.video_tokenizer(video.to(self.video_tokenizer.device), return_latents = True)
 
             _, (embeds, next_time_cache) = self.forward(
                 latents = latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
-                rewards = rewards,
+                rewards = rewards.to(self.device) if exists(rewards) else None,
                 discrete_actions = discrete_actions,
                 continuous_actions = continuous_actions,
                 time_cache = time_cache,
@@ -3322,7 +3327,8 @@ class DynamicsWorldModel(Module):
         return_intermediates = False,
         add_autoregressive_action_loss = True,
         update_loss_ema = None,
-        latent_has_view_dim = False
+        latent_has_view_dim = False,
+        end_to_end_train=False, # whether to backprop through the video tokenizer
     ):
         # handle video or latents
 
@@ -3348,6 +3354,9 @@ class DynamicsWorldModel(Module):
             latents = self.video_tokenizer.tokenize(video)
             latents = unpack_views(latents, '* t n d')
             latents = rearrange(latents, 'b v t n d -> b t v n d')
+
+            if not end_to_end_train:
+                latents = latents.detach()
 
         if latents.ndim == 4:
             latents = rearrange(latents, 'b t v d -> b t v 1 d') # 1 latent edge case
