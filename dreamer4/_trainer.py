@@ -6,6 +6,6 @@ __all__ = []
 # %% ../nbs/02_trainer.ipynb 2
 import torch
 import matplotlib.pyplot as plt
-from ._core import build_tiny_pinpad_dataset, make_tiny_dataloader
+from ._core import build_tiny_pinpad_dataset, make_tiny_dataloader, build_pinpad_datasets_for_trainers
 from .dreamer4 import VideoTokenizer, DynamicsWorldModel
 from .trainers import VideoTokenizerTrainer, SimTrainer, cycle, BehaviorCloneTrainer

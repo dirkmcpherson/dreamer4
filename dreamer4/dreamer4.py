@@ -1518,7 +1518,9 @@ class AxialSpaceTimeTransformer(Module):
         rnn_time = True,
     ):
         super().__init__()
-        assert depth >= time_block_every, f'depth must be at least {time_block_every}'
+        # assert depth >= time_block_every, f'depth must be at least {time_block_every}'
+        if depth < time_block_every:
+            print(f'Warning: depth {depth} is less than time_block_every {time_block_every}. No time attention blocks will be created.')
 
         # hyper connections
 
@@ -1675,19 +1677,37 @@ class AxialSpaceTimeTransformer(Module):
 
         for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time in zip(self.layers, self.rnn_layers, self.is_time):
 
-            tokens = pre_attn_rearrange(tokens)
+            # --- START FIX: Determine if we restrict processing ---
+            should_restrict_time = layer_is_time and self.restrict_time_attention_to_special
+            
+            # If restricting, we split tokens now. 
+            # Note: We assume packed order is [Normal, Special]. 
+            # In your tokenizer pack((tokens, latents)), latents are last. Correct.
+            if should_restrict_time:
+                num_special = self.num_special_spatial_tokens # these are the latents for the tokenizer, and the agent tokens for RL (double check)
+                tokens_normal = tokens[:, :, :-num_special, :]
+                tokens_special = tokens[:, :, -num_special:, :]
+                
+                # We only process 'tokens_special' through the time layer
+                tokens_active = tokens_special
+            else:
+                tokens_active = tokens
+            # --- END FIX PREP ---
+
+            tokens_active = pre_attn_rearrange(tokens_active)
 
             # maybe rnn for time
 
             if layer_is_time and exists(maybe_rnn):
+                # Note: If restricted, RNN only runs on special tokens (which is correct for tokenizer)
+                tokens_active, inverse_pack_batch = pack_one(tokens_active, '* t d')
 
-                tokens, inverse_pack_batch = pack_one(tokens, '* t d')
+                tokens_active, layer_rnn_hiddens = maybe_rnn(tokens_active, next(iter_rnn_prev_hiddens, None)) # todo, handle rnn cache
 
-                tokens, layer_rnn_hiddens = maybe_rnn(tokens, next(iter_rnn_prev_hiddens, None)) # todo, handle rnn cache
+                tokens_active = inverse_pack_batch(tokens_active)
 
-                tokens = inverse_pack_batch(tokens)
-
-                rnn_hiddens.append(layer_rnn_hiddens)
+                if not should_restrict_time: # Only save RNN hiddens if full run (or handle split state logic if needed)
+                    rnn_hiddens.append(layer_rnn_hiddens)
 
             # when is a axial time attention block, should be causal
 
@@ -1700,25 +1720,50 @@ class AxialSpaceTimeTransformer(Module):
             maybe_kv_cache = next(iter_kv_cache, None) if layer_is_time else None
 
             # residual values
-
-            layer_residual_values = maybe(pre_attn_rearrange)(residual_values)
+            
+            # --- START FIX: Slice Residuals ---
+            if should_restrict_time and exists(residual_values):
+                # Slice residuals to match the active tokens (special only)
+                # residual_values shape: (b, t, s, d) or similar depending on rearrange
+                # pre_attn_rearrange for time usually does: b t s d -> b s t d
+                # So we need to be careful. 
+                
+                # Apply rearrange first to get into attention shape
+                active_res_values = maybe(pre_attn_rearrange)(residual_values)
+                
+                # Now slice. 'b s t d'. Special are at end of 's' dim (dim 1)
+                active_res_values = active_res_values[:, -self.num_special_spatial_tokens:, :, :]
+            else:
+                layer_residual_values = maybe(pre_attn_rearrange)(residual_values)
+                active_res_values = layer_residual_values
+            # --- END FIX RESIDUALS ---
 
             # attention layer
 
-            tokens, attn_intermediates = attn(
-                tokens,
+            tokens_active, attn_intermediates = attn(
+                tokens_active,
                 rotary_pos_emb = layer_rotary_pos_emb,
                 attend_fn = attend_fn,
                 kv_cache = maybe_kv_cache,
-                residual_values = layer_residual_values,
+                residual_values = active_res_values,
                 return_intermediates = True
             )
 
-            tokens = post_attn_rearrange(tokens)
+            tokens_active = post_attn_rearrange(tokens_active)
 
             # feedforward layer
 
-            tokens = ff(tokens)
+            tokens_active = ff(tokens_active)
+
+            # --- START FIX: Recombine ---
+            if should_restrict_time:
+                # tokens_active is just the processed special tokens.
+                # tokens_normal is the untouched normal tokens.
+                # Recombine them.
+                tokens = cat((tokens_normal, tokens_active), dim=2)
+            else:
+                tokens = tokens_active
+            # --- END FIX RECOMBINE ---
 
             # save kv cache if is time layer
 
@@ -1729,6 +1774,7 @@ class AxialSpaceTimeTransformer(Module):
 
             space_or_time_inputs = normed_time_attn_inputs if layer_is_time else normed_space_attn_inputs
 
+            # Only log inputs if we didn't restrict (or just log special inputs? Usually fine to log whatever passed through)
             space_or_time_inputs.append(attn_intermediates.normed_inputs)
 
         tokens = self.reduce_streams(tokens)
@@ -1743,7 +1789,7 @@ class AxialSpaceTimeTransformer(Module):
             return out
 
         intermediates = TransformerIntermediates(
-            stack(time_attn_kv_caches),
+            stack(time_attn_kv_caches) if len(time_attn_kv_caches) > 0 else None,
             safe_stack(normed_time_attn_inputs),
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens)
@@ -1813,6 +1859,12 @@ class VideoTokenizer(Module):
             Rearrange('b t h w (p1 p2 c) -> b c t (h p1) (w p2)', p1 = patch_size, p2 = patch_size),
         )
 
+        # encoder pos embed
+        # Default to a reasonable max size (e.g. 16x16 or 32x32) if image_height is None
+        grid_h = image_height // patch_size if image_height else 16
+        grid_w = image_width // patch_size if image_width else 16
+        self.encoder_pos_emb = nn.Parameter(torch.randn(1, 1, grid_h, grid_w, dim) * 0.02)
+
         # encoder space / time transformer
 
         self.encoder_transformer = AxialSpaceTimeTransformer(
@@ -1821,6 +1873,7 @@ class VideoTokenizer(Module):
             attn_dim_head = attn_dim_head,
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
+            restrict_time_attention_to_special=True,
             num_special_spatial_tokens = num_latent_tokens,
             num_residual_streams = num_residual_streams,
             final_norm = True
@@ -1924,13 +1977,26 @@ class VideoTokenizer(Module):
 
         # generate decoder positional embedding and concat the latent token
 
-        spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
-        spatial_pos_width = torch.linspace(-1., 1., num_patch_width, device = device)
+        # Learn the decoder positional embeddings based on patch grid coordinates (old, better but we're debugging)
+        if use_meshgrid_decode:=False:
+            spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
+            spatial_pos_width = torch.linspace(-1., 1., num_patch_width, device = device)
 
-        space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
+            space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
 
-        decoder_pos_emb = self.to_decoder_pos_emb(space_height_width_coor)
-        decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time)
+            decoder_pos_emb = self.to_decoder_pos_emb(space_height_width_coor)
+            decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time)
+        else:
+            # 1. Grab the Encoder's exact map (1, 1, H, W, D)
+            # Note: We assume decoder resolution == encoder resolution for now
+            pos_emb = self.encoder_pos_emb 
+            
+            # 2. Flatten to sequence (1, 1, N, D)
+            flat_pos_emb = rearrange(pos_emb, 'b t h w d -> b t (h w) d')
+            
+            # 3. Repeat for batch/time
+            decoder_pos_emb = repeat(flat_pos_emb, '1 1 n d -> b t n d', b=batch, t=time)
+            # -------------------------
 
         tokens, packed_latent_shape = pack((decoder_pos_emb, latent_tokens), 'b t * d')
 
@@ -1941,6 +2007,17 @@ class VideoTokenizer(Module):
         # unpack latents
 
         tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
+
+        if not use_meshgrid_decode:
+            # --- THE FIX: Unflatten Sequence (N) back to Grid (H, W) ---
+            # Current shape: (b, t, n, d) -> (b, t, h*w, d) -> 4 Dimensions
+            # Target shape:  (b, t, h, w, d) -> 5 Dimensions
+            
+            h_grid = height // self.patch_size
+            w_grid = width // self.patch_size
+            
+            tokens = rearrange(tokens, 'b t (h w) d -> b t h w d', h=h_grid, w=w_grid)
+            # -----------------------------------------------------------
 
         # project back to patches
 
@@ -1976,9 +2053,6 @@ class VideoTokenizer(Module):
 
         tokens = self.patch_to_tokens(video)
 
-        # get some dimensions
-
-        num_patch_height, num_patch_width, _ = tokens.shape[-3:]
 
         # masking
 
@@ -1994,6 +2068,16 @@ class VideoTokenizer(Module):
 
             tokens = einx.where('..., d, ... d', mask_patch, self.mask_token, tokens)
 
+
+        # add encoder positional embedding
+        if self.encoder_pos_emb.shape[-2:] == tokens.shape[-2:]: 
+            # Safety check in case you change resolution later
+            tokens = tokens + self.encoder_pos_emb
+        else:
+            # Optional: Interpolate if resolution changed (advanced)
+            print("Warning: Interpolating encoder positional embeddings due to resolution change.")
+            pass
+
         # pack space
 
         tokens, inverse_pack_space = pack_one(tokens, 'b t * d')
@@ -2001,6 +2085,19 @@ class VideoTokenizer(Module):
         # add the latent
 
         latents = repeat(self.latent_tokens, 'n d -> b t n d', b = tokens.shape[0], t = tokens.shape[1])
+
+
+        # Flatten the encoder's spatial position embedding (1, 1, H, W, D) -> (1, 1, N, D)
+        # This ensures Latent[i] has the exact same spatial ID as Pixel[i]
+        flat_pos_emb = rearrange(self.encoder_pos_emb, 'b t h w d -> b t (h w) d')
+
+        # Safety check: only add if the counts match (e.g. 256 latents == 16x16 grid)
+        if flat_pos_emb.shape[2] == latents.shape[2]:
+            latents = latents + flat_pos_emb
+        else:
+            # Optional: Interpolate if resolution changed (advanced)
+            print("Warning: Interpolating latent positional embeddings due to resolution change.")
+            pass
 
         tokens, packed_latent_shape = pack((tokens, latents), 'b t * d')
 
@@ -2414,9 +2511,12 @@ class DynamicsWorldModel(Module):
     ):
         times = signal_levels.float() / self.max_steps
 
+        target_dtype = self.signal_levels_embed.weight.dtype
+        times = times.to(target_dtype)
+
         if not exists(align_dims_left_to):
             return times
-
+        
         return align_dims_left(times, align_dims_left_to)
 
     # evolutionary policy optimization - https://web3.arxiv.org/abs/2503.19037
@@ -3439,6 +3539,8 @@ class DynamicsWorldModel(Module):
         # times is from 0 to 1
 
         times = self.get_times_from_signal_level(signal_levels)
+
+        if exists(latents): times = times.to(latents.dtype)
 
         if not latent_is_noised:
             # get the noise

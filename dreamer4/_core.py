@@ -2,7 +2,8 @@
 
 # %% auto 0
 __all__ = ['to_device', 'make_tiny_dataloader', 'batchify_video', 'TinyOverfitConfig', 'train_tiny_overfit', 'plot_losses',
-           'WrappedEnv', 'build_tiny_pinpad_dataset']
+           'WrappedEnv', 'build_tiny_pinpad_dataset', 'NormalizeObsWrapper', 'PinPadBCEpisodes', 'TokFromBCEpisodes',
+           'build_pinpad_datasets_for_trainers']
 
 # %% ../nbs/00_core.ipynb 2
 from dataclasses import dataclass
@@ -203,3 +204,195 @@ def build_tiny_pinpad_dataset(device='cuda', n=1024, episode_length=8):
     print(f"Built tiny PinPad dataset with {videos.shape[0]} videos of shape {videos.shape[1:]} - (c, t, h, w). Success rate {eps_containing_success / eps:1.1%}")
     return torch.utils.data.TensorDataset(videos), env
     # return videos
+
+# %% ../nbs/00_core.ipynb 8
+import random
+from typing import Optional, Literal, Dict, Any, List
+from .envs.pinpad import PinPad, MotionPlannerPinPad
+
+import torch
+from torch.utils.data import Dataset, TensorDataset
+
+class NormalizeObsWrapper:
+    """
+    Wraps a PinPad env that returns (C,H,W) uint8/float in 0..255 and
+    converts observations to float32 in [0,1]. Everything else is passthrough.
+    """
+    def __init__(self, env):
+        self.env = env
+        # expose gym-ish interface
+        self.action_space = env.action_space
+        self.observation_space = getattr(env, "observation_space", None)
+        self.device = getattr(env, "device", "cpu")
+        self.size = getattr(env, "size", (64, 64))
+        self.task = getattr(env, "task", "three")
+
+    def _norm(self, obs):
+        # obs is a torch.Tensor (C,H,W) from your PinPad
+        obs = obs.to(torch.float32)
+        # If it looks like 0..255, scale to 0..1. Otherwise assume already normalized.
+        if obs.max() > 1.0 or obs.min() < 0.0:
+            obs = obs / 255.0
+        return obs
+
+    def reset(self, *args, **kwargs):
+        obs = self.env.reset(*args, **kwargs)
+        return self._norm(obs)
+
+    def step(self, action):
+        obs, r, done, truncated, info = self.env.step(action)
+        return self._norm(obs), r, done, truncated, info
+
+    # Optional: pass through render() etc.
+    def render(self, *args, **kwargs):
+        return self.env.render(*args, **kwargs)
+
+class PinPadBCEpisodes(Dataset):
+    def __init__(self, env, n_episodes=512, episode_length=16, use_motion_planner=True, return_length=16):
+        self.samples = []
+        H, W = env.size[0], env.size[1]
+
+        self.episode_length=episode_length; self.return_length=return_length
+
+        if use_motion_planner:
+            mp = MotionPlannerPinPad(env)
+
+        for _ in range(n_episodes):
+            frames = []
+            rewards = []
+            actions = []
+
+            obs = env.reset()                  # (C, H, W) float in 0..255
+            for t in range(episode_length):
+                frames.append(obs.detach().cpu())              # store frame BEFORE action (standard)
+
+                if use_motion_planner:
+                    act = mp.sample()
+                else:
+                    act = env.action_space.sample()
+
+                obs, r, done, _, _ = env.step(act)
+
+                rewards.append(float(r))        # scalar
+                actions.append(int(act))        # scalar int
+
+                if done:                        # keep fixed length anyway
+                    # pad the remainder by repeating last frame / zeros reward / no-op
+                    for _pad in range(t + 1, episode_length):
+                        frames.append(obs)
+                        rewards.append(0.0)
+                        actions.append(0)
+                    break
+
+            # Stack & reshape
+            # frames: list of (C,H,W) -> (T,C,H,W) -> (C,T,H,W), normalize to [0,1]
+            frames = torch.stack(frames, dim=0).float()  # (T,C,H,W)
+            frames = frames.permute(1,0,2,3).contiguous()  # (C,T,H,W)
+            frames = frames.detach().cpu()  # <-- keep CPU
+
+
+            rewards = torch.tensor(rewards, dtype=torch.float32)  # (T,)
+            discrete = torch.tensor(actions, dtype=torch.long).unsqueeze(-1)  # (T,1)
+
+            # sanity
+            assert frames.shape[1] == episode_length
+            assert rewards.shape[0] == episode_length
+            assert discrete.shape[:2] == (episode_length, 1)
+
+            self.samples.append({
+                "video": frames,                # (C,T,H,W) float[0,1]
+                "rewards": rewards,             # (T,)
+                "discrete_actions": discrete,   # (T,1)
+            })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+
+        # support both storage styles
+        vid_key = "video_uint8" if "video_uint8" in s else "video"
+        v = s[vid_key]                 # (C,T,H,W)
+        r = s["rewards"]               # (T,)
+        a = s["discrete_actions"]      # (T,1)
+
+        C, T, H, W = v.shape
+        K = self.return_length
+        if K > T:
+            raise ValueError(f"return_length ({K}) > episode_length ({T})")
+
+        t0 = random.randint(0, T - K)  # inclusive range
+        t1 = t0 + K
+
+        # slice time dimension correctly
+        v = v[:, t0:t1]                # (C,K,H,W)
+        r = r[t0:t1]                   # (K,)
+        a = a[t0:t1]                   # (K,1)
+
+        # normalize if stored as uint8
+        if v.dtype == torch.uint8:
+            v = v.float().div_(255.0)
+
+        # normalize to lie between -1 and 1
+        v = v * 2.0 - 1.0
+
+        # keep memory friendly
+        v = v.contiguous()
+        r = r.contiguous()
+        a = a.contiguous()
+
+        return {"video": v, "rewards": r, "discrete_actions": a}
+
+
+class TokFromBCEpisodes(Dataset):
+    """
+    Sliding windows over bc_ds.samples[*]["video"] without extra storage.
+    Assumes bc_ds.samples[i]["video"] is (C,T,H,W) on CPU.
+    """
+    def __init__(self, bc_ds, window=16, stride=1):
+        self.bc = bc_ds
+        self.window = window
+        self.stride = stride
+        self.T = bc_ds.episode_length
+        self.starts_per_ep = max(0, (self.T - window)//stride + 1)
+
+    def __len__(self):
+        return len(self.bc.samples) * self.starts_per_ep
+
+    def __getitem__(self, i):
+        ep_idx = i // self.starts_per_ep
+        start  = (i % self.starts_per_ep) * self.stride
+        v = self.bc.samples[ep_idx]["video"]          # (C,T,H,W) CPU
+        v_window = v[:, start:start+self.window]      # (C,K,H,W) view
+
+        # 2. FIX: Shift to [-1, 1] to match Codebase B expectations
+        v_window = v_window * 2.0 - 1.0
+
+        return v_window
+
+def build_pinpad_datasets_for_trainers(
+    n_episodes=200,
+    episode_length=100,
+    tok_window=16,
+    device="cpu",
+    use_motion_planner=True,
+    normalize_in_env=True,   # <— new
+):
+    # base env
+    base_env = PinPad('three', length=episode_length, extra_obs=False,
+                      size=[64, 64], random_starting_pos=True, device=device)
+    env = NormalizeObsWrapper(base_env) if normalize_in_env else base_env
+    # ---- BC dataset (BehaviorCloneTrainer expects dict -> model(**batch))
+    # Separate env so RNG/state differs a bit
+    base_env_bc = PinPad('three', length=episode_length, extra_obs=False,
+                         size=[64, 64], random_starting_pos=True, device=device)
+    env_bc = NormalizeObsWrapper(base_env_bc) if normalize_in_env else base_env_bc
+    bc_ds = PinPadBCEpisodes(env_bc, n_episodes=n_episodes,
+                             episode_length=episode_length,
+                             use_motion_planner=use_motion_planner,
+                             return_length=tok_window)
+
+
+    tok_ds = TokFromBCEpisodes(bc_ds, window=tok_window, stride=1)
+    return tok_ds, bc_ds, env

@@ -105,12 +105,12 @@ class VideoTokenizerTrainer(Module):
         return self.accelerator.print(*args, **kwargs)
 
     def forward(
-        self, log_period=100
+        self, log_period=100, num_train_step=None,
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
         losses = []
-        for i in range(self.num_train_steps):
+        for i in range(self.num_train_steps if num_train_step is None else num_train_step):
             # robust to both TensorDataset and bare-tensor datasets
             batch = next(iter_train_dl)
             video = batch[0] if isinstance(batch, (tuple, list)) else batch
@@ -207,6 +207,7 @@ class BehaviorCloneTrainer(Module):
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
+        losses = []
         for _ in range(self.num_train_steps):
             batch_data = next(iter_train_dl)
 
@@ -227,8 +228,10 @@ class BehaviorCloneTrainer(Module):
             self.optim.zero_grad()
 
             self.total_updates += 1
+            losses.append(loss.detach().cpu().numpy())
 
         self.print(f'Trained for {self.num_train_steps} updates. New total: {self.total_updates}.')
+        return losses
 
 # training from dreams
 
