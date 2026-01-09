@@ -100,7 +100,7 @@ class PinPad(gym.Env):
       return 0.0
     else:
       self.next_tile_in_sequence += 1
-      return 0.01 * self.next_tile_in_sequence
+      return 1.0 * self.next_tile_in_sequence
 
   def reset(self):
     if self.random_starting_pos:
@@ -175,7 +175,7 @@ class PinPad(gym.Env):
         self.sequence.append(tile)
     if tuple(self.sequence) == self.target and not self.countdown:
       info = {'success': True}
-      reward += 10.0
+      reward += 100.0
       # print(f"!!!!SUCCESS!!!")
       self.countdown = 4
     else:

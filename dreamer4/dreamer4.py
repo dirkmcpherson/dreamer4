@@ -111,6 +111,12 @@ class Experience:
         experience_dict = asdict(self)
         experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
         return Experience(**experience_dict)
+    
+    def detach(self):
+        experience_dict = asdict(self)
+        experience_dict = tree_map(lambda t: t.detach() if is_tensor(t) else t, experience_dict)
+        return Experience(**experience_dict)
+
 
 def combine_experiences(
     exps: list[Experiences]
@@ -1592,6 +1598,7 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_spatial_tokens = num_special_spatial_tokens
+        self.abs_time_embed = nn.Embedding(1024, dim) # 1024 is just to leave space for long episodes
 
     def muon_parameters(self):
         muon_params = []
@@ -1658,6 +1665,26 @@ class AxialSpaceTimeTransformer(Module):
         # rotary
 
         rotary_pos_emb = self.time_rotary(rotary_seq_len, offset = rotary_pos_offset)
+
+
+        # ---------------------------------------------------------
+        # [FIX] Add Absolute Time Embeddings for Spatial/FF Layers
+        # ---------------------------------------------------------
+        
+        # Generate time indices [0, 1, 2, ... t-1]
+        time_ids = torch.arange(time, device=device)
+        
+        # Get embeddings: (t, d)
+        abs_time_emb = self.abs_time_embed(time_ids)
+        
+        # Broadcast to match tokens: (b, t, s, d)
+        # We unsqueeze to add batch (dim 0) and space (dim 2)
+        abs_time_emb = repeat(abs_time_emb, 't d -> b t 1 d', b=batch)
+        
+        # Add to the residual stream permanently
+        tokens = tokens + abs_time_emb 
+        # ---------------------------------------------------------
+
 
         # value residual
 
@@ -2271,6 +2298,14 @@ class DynamicsWorldModel(Module):
                 Rearrange('b t v s (n d) -> b t v (s n) d', n = latent_tokens_to_space)
             )
 
+
+        # define spatial embeddings
+        # We need 1 unique vector for every token in the spatial grid (e.g. 16 or 256)
+        self.spatial_pos_embed = nn.Embedding(self.num_latent_tokens, dim)
+
+        # Initialize small to prevent disrupting the initial forward pass
+        nn.init.normal_(self.spatial_pos_embed.weight, std=0.2)
+
         # number of video views, for robotics, which could have third person + wrist camera at least
 
         assert num_video_views >= 1
@@ -2359,13 +2394,22 @@ class DynamicsWorldModel(Module):
 
         # policy head
 
-        self.policy_head = create_mlp(
-            dim_in = dim,
-            dim = dim * 4,
-            dim_out = dim * 4,
-            depth = policy_head_mlp_depth
-        )
+        # self.policy_head = create_mlp(
+        #     dim_in = dim,
+        #     dim = dim * 4,
+        #     dim_out = dim * 4,
+        #     depth = policy_head_mlp_depth
+        # )
 
+        self.policy_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            create_mlp(
+                dim_in = dim,
+                dim = dim * 4,
+                dim_out = dim * 4,
+                depth = policy_head_mlp_depth
+            )
+        )
         # action embedder
 
         self.action_embedder = ActionEmbedder(
@@ -2406,11 +2450,21 @@ class DynamicsWorldModel(Module):
 
         # value head
 
-        self.value_head = create_mlp(
-            dim_in = dim,
-            dim = dim * 4,
-            dim_out = self.reward_encoder.num_bins,
-            depth = value_head_mlp_depth,
+        # self.value_head = create_mlp(
+        #     dim_in = dim,
+        #     dim = dim * 4,
+        #     dim_out = self.reward_encoder.num_bins,
+        #     depth = value_head_mlp_depth,
+        # )
+
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            create_mlp(
+                dim_in = dim,
+                dim = dim * 4,
+                dim_out = self.reward_encoder.num_bins,
+                depth = value_head_mlp_depth,
+            )
         )
 
         # efficient axial space / time transformer
@@ -2590,7 +2644,7 @@ class DynamicsWorldModel(Module):
         if env_is_vectorized:
             video = rearrange(init_frame, 'b c vh vw -> b c 1 vh vw')
         else:
-            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw') # JS: weird that the channel gets moved here, but it must be more efficient.
+            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
 
         batch, device = video.shape[0], video.device
 
@@ -3035,7 +3089,7 @@ class DynamicsWorldModel(Module):
 
         # maybe take value optimizer step
 
-        if exists(policy_optim):
+        if exists(value_optim):
             value_loss.backward()
 
             value_optim.step()
@@ -3664,6 +3718,26 @@ class DynamicsWorldModel(Module):
 
             space_tokens = self.latents_to_spatial_tokens(noised_latents)
 
+
+
+            # Inject Spatial Positional Embeddings
+            # ---------------------------------------------------------
+            # Current shape: (batch, time, view, num_tokens, dim)
+            device = space_tokens.device
+            n = space_tokens.shape[-2] # num_latent_tokens
+
+            # Create indices [0, 1, ... N-1]
+            spatial_ids = torch.arange(n, device=device)
+
+            # Get embeddings (N, D)
+            s_emb = self.spatial_pos_embed(spatial_ids)
+
+            # Broadcast and Add: (N, D) -> (1, 1, 1, N, D)
+            # This tells the model: "Token 0 is top-left", "Token 1 is top-right", etc.
+            space_tokens = space_tokens + rearrange(s_emb, 'n d -> 1 1 1 n d')
+            # ---------------------------------------------------------
+
+
             # maybe add view embedding
 
             if self.video_has_multi_view:
@@ -3740,6 +3814,12 @@ class DynamicsWorldModel(Module):
             # returning
 
             predictions = Predictions(pred, pred_proprio, pred_state)
+
+            # --- FIX START ---
+            # Normalize agent_tokens to tame the residual stream growth (Norm 105 -> 22)
+            # We use the last dimension (d) for normalization
+            agent_tokens = F.layer_norm(agent_tokens, agent_tokens.shape[-1:])
+            # --- FIX END ---
 
             embeds = Embeds(agent_tokens, state_pred_token)
 
