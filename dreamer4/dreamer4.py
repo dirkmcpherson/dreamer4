@@ -744,7 +744,6 @@ class ActionEmbedder(Module):
 
             if self.squeeze_unembed_preds or squeeze_one_pred_head:
                 continuous_action_mean_log_var = safe_squeeze_first(continuous_action_mean_log_var)
-
         return discrete_action_logits, continuous_action_mean_log_var
 
     def sample(
@@ -2990,7 +2989,7 @@ class DynamicsWorldModel(Module):
         if use_pmpo:
             # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
             # seems to be weighted across batch and time, iiuc
-            # eq (10) in https://arxiv.org/html/2410.04166v1
+            # eq (10) in DreamerV4 - https://arxiv.org/abs/2509.24527
 
             if exists(mask):
                 pos_advantage_mask &= mask
@@ -3118,8 +3117,9 @@ class DynamicsWorldModel(Module):
         return_for_policy_optimization = False,
         return_time_cache = False,
         store_agent_embed = True,
-        store_old_action_unembeds = True
-
+        store_old_action_unembeds = True,
+        discrete_temperature = 1.,
+        continuous_temperature = 1.,
     ): # (b t n d) | (b c t h w)
 
         # handy flag for returning generations for rl
@@ -3222,39 +3222,62 @@ class DynamicsWorldModel(Module):
 
             # denoising steps
 
+            curr_discrete_actions = decoded_discrete_actions
+            curr_continuous_actions = decoded_continuous_actions
+            curr_rewards = decoded_rewards
+
             for step in range(num_steps + int(take_extra_step)):
 
                 is_last_step = (step + 1) == num_steps
 
                 signal_levels = full((batch_size, 1), step * step_size, dtype = torch.long, device = self.device)
  
-                # noising past latent context
+                # Determine if we rely on cache for context
+                context_in_cache = use_time_cache and exists(time_cache)
 
-                noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
+                if context_in_cache:
+                    # If we have cache, we only process the new latent
+                    noised_latent_with_context = noised_latent
+                    noised_proprio_with_context = noised_proprio
+                    signal_levels_with_context = signal_levels
+                    pack_context_shape = None # Flag to skip unpacking
 
-                noised_latent_with_context, pack_context_shape = pack((noised_context, noised_latent), 'b * v n d')
+                    # slice the accumulated tensors to the last step
+                    if exists(decoded_discrete_actions):
+                        curr_discrete_actions = decoded_discrete_actions[:, -1:]
+                    if exists(decoded_continuous_actions):
+                        curr_continuous_actions = decoded_continuous_actions[:, -1:]
+                    if exists(decoded_rewards):
+                        curr_rewards = decoded_rewards[:, -1:]
 
-                # handle proprio
+                else:
+                    # noising past latent context
 
-                noised_proprio_with_context = None
+                    noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
 
-                if has_proprio:
-                    noised_proprio_context = proprio.lerp(past_proprio_context_noise, context_signal_noise)
-                    noised_proprio_with_context, _ = pack((noised_proprio_context, noised_proprio), 'b * d')
+                    noised_latent_with_context, pack_context_shape = pack((noised_context, noised_latent), 'b * v n d')
 
-                # proper signal levels
+                    # handle proprio
 
-                signal_levels_with_context = F.pad(signal_levels, (curr_time_steps, 0), value = self.max_steps - 1)
+                    noised_proprio_with_context = None
+
+                    if has_proprio:
+                        noised_proprio_context = proprio.lerp(past_proprio_context_noise, context_signal_noise)
+                        noised_proprio_with_context, _ = pack((noised_proprio_context, noised_proprio), 'b * d')
+
+                    # proper signal levels
+
+                    signal_levels_with_context = F.pad(signal_levels, (curr_time_steps, 0), value = self.max_steps - 1)
 
                 pred, (embeds, next_time_cache) = self.forward(
                     latents = noised_latent_with_context,
                     signal_levels = signal_levels_with_context,
                     step_sizes = step_size,
-                    rewards = decoded_rewards,
+                    rewards = curr_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
-                    discrete_actions = decoded_discrete_actions,
-                    continuous_actions = decoded_continuous_actions,
+                    discrete_actions = curr_discrete_actions,
+                    continuous_actions = curr_continuous_actions,
                     proprio = noised_proprio_with_context,
                     time_cache = time_cache,
                     latent_is_noised = True,
@@ -3278,12 +3301,13 @@ class DynamicsWorldModel(Module):
                 pred_proprio = pred.proprioception
                 pred = pred.flow
 
-                # unpack pred
+                # unpack pred if we packed it
 
-                _, pred = unpack(pred, pack_context_shape, 'b * v n d')
+                if exists(pack_context_shape):
+                    _, pred = unpack(pred, pack_context_shape, 'b * v n d')
 
-                if has_proprio:
-                    _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
+                    if has_proprio:
+                        _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
 
                 # derive flow, based on whether in x-space or not
 
@@ -3346,7 +3370,13 @@ class DynamicsWorldModel(Module):
 
                 # sample actions
 
-                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
+                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(
+                    policy_embed,
+                    pred_head_index = 0,
+                    squeeze = True,
+                    discrete_temperature = discrete_temperature,
+                    continuous_temperature = continuous_temperature
+                )
 
                 decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
                 decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
@@ -3650,9 +3680,8 @@ class DynamicsWorldModel(Module):
 
                 reward_tokens = self.reward_encoder.embed(two_hot_encoding)
 
-                pop_last_reward = int(reward_tokens.shape[1] == agent_tokens.shape[1]) # the last reward is popped off during training, during inference, it is not known yet, so need to handle this edge case
-
-                reward_tokens = pad_at_dim(reward_tokens, (1, -pop_last_reward), dim = -2, value = 0.)  # shift as each agent token predicts the next reward
+                if not exists(time_cache):
+                    reward_tokens = pad_at_dim(reward_tokens, (1, -1), dim = -2, value = 0.) # shift as each agent token predicts the next reward
 
                 reward_tokens = add('1 d, b t d', self.reward_learned_embed, reward_tokens)
 
@@ -3698,9 +3727,9 @@ class DynamicsWorldModel(Module):
             )
 
             # handle first timestep not having an associated past action
-
-            if action_tokens.shape[1] == (time - 1):
-                action_tokens = pad_at_dim(action_tokens, (1, 0), value = 0. , dim = 1)
+            # autoregressive training: shift to the right
+            if not exists(time_cache):
+                action_tokens = pad_at_dim(action_tokens, (1, -1), dim = -2, value = 0.)
 
             action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
 
@@ -3709,6 +3738,15 @@ class DynamicsWorldModel(Module):
 
         else:
             action_tokens = empty_token # else empty off agent tokens
+
+        continuous_tokens = None
+
+        if exists(continuous_actions):
+            continuous_tokens = self.action_embedder(continuous_actions = continuous_actions)
+
+            if not exists(time_cache):
+                continuous_tokens = pad_at_dim(continuous_tokens, (1, -1), dim = -2, value = 0.)
+
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 
@@ -3815,11 +3853,8 @@ class DynamicsWorldModel(Module):
 
             predictions = Predictions(pred, pred_proprio, pred_state)
 
-            # --- FIX START ---
-            # Normalize agent_tokens to tame the residual stream growth (Norm 105 -> 22)
-            # We use the last dimension (d) for normalization
+            # Normalize agent_tokens to tame the residual stream growth as in DreamerV4 (2509.24527)
             agent_tokens = F.layer_norm(agent_tokens, agent_tokens.shape[-1:])
-            # --- FIX END ---
 
             embeds = Embeds(agent_tokens, state_pred_token)
 
@@ -3900,7 +3935,7 @@ class DynamicsWorldModel(Module):
             else:
                 pred_target = data
         else:
-            # shortcut training - Frans et al. https://arxiv.org/abs/2410.12557
+            # shortcut training - DreamerV4 - https://arxiv.org/abs/2509.24527
 
             # basically a consistency loss where you ensure quantity of two half steps equals one step
             # dreamer then makes it works for x-space with some math
@@ -3985,11 +4020,11 @@ class DynamicsWorldModel(Module):
             if rewards.ndim == 2: # (b t)
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
-            reward_pred = self.to_reward_pred(encoded_agent_tokens[:, :-1])
+            reward_pred = self.to_reward_pred(encoded_agent_tokens)
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :-1], self.multi_token_pred_len)
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding, self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
@@ -3998,7 +4033,7 @@ class DynamicsWorldModel(Module):
             reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
             if is_var_len:
-                reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+                reward_loss = reward_losses[loss_mask].mean(dim = 0)
             else:
                 reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
 
@@ -4027,19 +4062,15 @@ class DynamicsWorldModel(Module):
         ):
             assert self.action_embedder.has_actions
 
-            # handle actions having time vs time - 1 length
-            # remove the first action if it is equal to time (as it would come from some agent token in the past)
+            # autoregressive action prediction:
+            # latent[t] + action[t-1] -> agent_token[t] -> action[t]
+            # No need to shift targets here as they should align with agent_token[t]
 
-            if exists(discrete_actions) and discrete_actions.shape[1] == time:
-                discrete_actions = discrete_actions[:, 1:]
-
-            if exists(continuous_actions) and continuous_actions.shape[1] == time:
-                continuous_actions = continuous_actions[:, 1:]
 
             # only for 1 agent
 
             agent_tokens = rearrange(agent_tokens, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(agent_tokens[:, :-1])
+            policy_embed = self.policy_head(agent_tokens)
 
             # constitute multi token prediction targets
 
@@ -4066,7 +4097,7 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     discrete_action_losses = rearrange(-discrete_log_probs, 'mtp b t na -> b t na mtp')
-                    discrete_action_loss = reduce(discrete_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                    discrete_action_loss = reduce(discrete_action_losses[loss_mask], '... mtp -> mtp', 'mean')
                 else:
                     discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
 
@@ -4075,7 +4106,7 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     continuous_action_losses = rearrange(-continuous_log_probs, 'mtp b t na -> b t na mtp')
-                    continuous_action_loss = reduce(continuous_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                    continuous_action_loss = reduce(continuous_action_losses[loss_mask], '... mtp -> mtp', 'mean')
                 else:
                     continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
