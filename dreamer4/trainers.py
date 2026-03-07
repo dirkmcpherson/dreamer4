@@ -370,6 +370,12 @@ class SimTrainer(Module):
 
         self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
         self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+        
+        # World Model Optimizer - Exclude heads to avoid conflicts
+        head_params = set(model.policy_head_parameters()) | set(model.value_head_parameters())
+        model_params = [p for p in model.parameters() if p not in head_params]
+        
+        self.model_optim = optim_klass(model_params, **optim_kwargs)
 
         self.max_grad_norm = max_grad_norm
 
@@ -384,10 +390,12 @@ class SimTrainer(Module):
             self.model,
             self.policy_head_optim,
             self.value_head_optim,
+            self.model_optim
         ) = self.accelerator.prepare(
             self.model,
             self.policy_head_optim,
-            self.value_head_optim
+            self.value_head_optim,
+            self.model_optim
         )
 
     @property
@@ -470,6 +478,30 @@ class SimTrainer(Module):
                 old_values,
                 rewards
             ) in dataloader:
+            
+                (
+                    latents,
+                    discrete_actions,
+                    continuous_actions,
+                    discrete_log_probs,
+                    continuous_log_probs,
+                    agent_embed,
+                    discrete_old_action_unembeds,
+                    continuous_old_action_unembeds,
+                    old_values,
+                    rewards
+                ) = tuple(t.to(self.device) for t in (
+                    latents,
+                    discrete_actions,
+                    continuous_actions,
+                    discrete_log_probs,
+                    continuous_log_probs,
+                    agent_embed,
+                    discrete_old_action_unembeds,
+                    continuous_old_action_unembeds,
+                    old_values,
+                    rewards
+                ))
 
                 actions = (
                     discrete_actions if has_discrete else None,
@@ -499,34 +531,55 @@ class SimTrainer(Module):
                 )
 
                 policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
-
-                # all_losses = {
-                #     'policy_head_loss': policy_head_loss.item(),
-                #     'value_head_loss': value_head_loss.item(),
-                #     'model_loss': 
-                # }
-
-                self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+                
+                # --- World Model Training ---
+                # We need to extract the raw tensors from experience for the model forward pass
+                # DynamicsWorldModel.forward expects latents, actions, rewards, etc.
+                
+                # We need to construct step_sizes and signal_levels (or let the model sample them)
+                # The model's forward method handles sampling if they aren't provided.
+                
+                # IMPORTANT: batch_experience has fields like latents, actions etc.
+                # but valid SimTrainer training requires valid step_sizes/signal_levels for shortcut learning
+                # The model defaults to sampling these if not provided.
+                
+                # We also need to be careful about gradients. The policy/value head training typically
+                # detaches the world model features (or only learns heads).
+                # But here we WANT to train the world model.
+                
+                wm_loss = self.model(
+                    latents = latents,
+                    # For DreamerV4, we usually want to train on the ground truth actions/rewards from the buffer
+                    # The gathered 'experience' actions are what we use.
+                    discrete_actions = actions[0],
+                    continuous_actions = actions[1],
+                    rewards = rewards
+                )
 
                 # update policy head
-
                 self.accelerator.backward(policy_head_loss)
 
-                if exists(self.max_grad_norm):
-                    self.accelerator.clip_grad_norm_(self.model.policy_head_parameters()(), self.max_grad_norm)
-
-                self.policy_head_optim.step()
-                self.policy_head_optim.zero_grad()
-
                 # update value head
-
                 self.accelerator.backward(value_head_loss)
 
+                # update world model
+                self.accelerator.backward(wm_loss)
+                
+                # Clip grads
                 if exists(self.max_grad_norm):
+                    self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
                     self.accelerator.clip_grad_norm_(self.model.value_head_parameters(), self.max_grad_norm)
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+                # Step all
+                self.policy_head_optim.step()
                 self.value_head_optim.step()
+                self.model_optim.step()
+                
+                # Zero all
+                self.policy_head_optim.zero_grad()
                 self.value_head_optim.zero_grad()
+                self.model_optim.zero_grad()
 
         self.print('training complete')
 

@@ -2686,12 +2686,12 @@ class DynamicsWorldModel(Module):
             latents = self.video_tokenizer(video.to(self.video_tokenizer.device), return_latents = True)
 
             _, (embeds, next_time_cache) = self.forward(
-                latents = latents,
+                latents = latents[:, -1:] if use_time_cache and step_index > 1 else latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
-                rewards = rewards.to(self.device) if exists(rewards) else None,
-                discrete_actions = discrete_actions,
-                continuous_actions = continuous_actions,
+                rewards = (rewards[:, -1:] if use_time_cache and step_index > 1 else rewards).to(self.device) if exists(rewards) else None,
+                discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) and use_time_cache and step_index > 1 else discrete_actions,
+                continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) and use_time_cache and step_index > 1 else continuous_actions,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
@@ -2878,6 +2878,12 @@ class DynamicsWorldModel(Module):
             rewards = rewards.masked_fill(~mask_for_gae, 0.)
             old_values = old_values.masked_fill(~mask_for_gae, 0.)
 
+        if rewards.ndim == 3 and rewards.shape[-1] == 1:
+            rewards = rewards.squeeze(-1)
+
+        if old_values.ndim == 3 and old_values.shape[-1] == 1:
+            old_values = old_values.squeeze(-1)
+
         # calculate returns
 
         returns = calc_gae(rewards, old_values, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
@@ -2983,8 +2989,10 @@ class DynamicsWorldModel(Module):
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
         entropies = safe_cat(entropies, dim = -1)
-
-        advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
+        
+        # Ensure advantage has action dimension for broadcasting against ratio (b, t, 1)
+        if advantage.ndim == 2:
+             advantage = advantage.unsqueeze(-1)
 
         if use_pmpo:
             # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
@@ -3729,7 +3737,14 @@ class DynamicsWorldModel(Module):
             # handle first timestep not having an associated past action
             # autoregressive training: shift to the right
             if not exists(time_cache):
-                action_tokens = pad_at_dim(action_tokens, (1, -1), dim = -2, value = 0.)
+                action_len = action_tokens.shape[1]
+
+                if action_len == (time - 1):
+                    prior_action_padding = (1, 0)
+                else:
+                    prior_action_padding = (1, -1)
+
+                action_tokens = pad_at_dim(action_tokens, prior_action_padding, dim = -2, value = 0.)
 
             action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
 
@@ -3749,6 +3764,7 @@ class DynamicsWorldModel(Module):
 
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
+
 
         def get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, state_pred_token, action_tokens, reward_tokens, agent_tokens, return_agent_tokens = False, return_time_cache = False):
 
@@ -3782,7 +3798,6 @@ class DynamicsWorldModel(Module):
                 space_tokens = add('b t v ... d, v d', space_tokens, self.view_emb)
 
             # merge spatial tokens
-
             space_tokens, inverse_pack_space_per_latent = pack_one(space_tokens, 'b t * d')
 
             num_spatial_tokens = space_tokens.shape[-2]
@@ -4017,12 +4032,17 @@ class DynamicsWorldModel(Module):
 
             encoded_agent_tokens = embeds.agent
 
-            if rewards.ndim == 2: # (b t)
+            if rewards.ndim == 2 or (rewards.ndim == 3 and rewards.shape[-1] == 1): # (b t) or (b t 1)
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
             reward_pred = self.to_reward_pred(encoded_agent_tokens)
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
+
+
+            if rewards.ndim == 3 and rewards.shape[-1] == 1:
+                 rewards = rewards.squeeze(-1)
+                 two_hot_encoding = self.reward_encoder(rewards)
 
             reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding, self.multi_token_pred_len)
 
