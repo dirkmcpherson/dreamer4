@@ -269,7 +269,11 @@ default to fp32).
    dataloader/step, atomic write, `latest` pointer, `--resume`. Tighten
    `strict=False` model loads.
 5. **Enable TF32 + bf16 everywhere** (`set_float32_matmul_precision('high')`,
-   `mixed_precision='bf16'` in all trainers).
+   `mixed_precision='bf16'` in all trainers). *Done for LIBERO scripts (2026-06-08).*
+   Note: bf16 autocast exposed two dtype bugs now fixed in `dreamer4.py` — (a)
+   `Attention` realigns q/k/v dtypes before SDPA/flash (qk-rmsnorm upcast the key
+   to fp32), and (b) `DynamicsWorldModel` keeps latents fp32 for the flow-matching
+   math while autocast still runs the transformer matmuls in bf16.
 6. **Scale the data pipeline:** *partially done (2026-06-08)* — `num_workers`,
    `pin_memory`, `persistent_workers` are now wired through both
    `VideoTokenizerTrainer` and `BehaviorCloneTrainer` (defaults 0/False) and

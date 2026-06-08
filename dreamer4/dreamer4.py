@@ -1754,6 +1754,13 @@ class Attention(Module):
 
         # attention
 
+        # qk-rmsnorm (and rotary) can upcast q or k to fp32 under mixed-precision
+        # autocast, while the un-normed value path keeps the autocast compute dtype;
+        # realign q, k, v to a single dtype so SDPA / flash attention accept them
+        if q.dtype != v.dtype or k.dtype != v.dtype:
+            q = q.type(v.dtype)
+            k = k.type(v.dtype)
+
         if exists(pope_pos_emb):
             out = flash_attn_with_pope(q, k, v, pos_emb = pope_pos_emb, causal = True, head_dimension_at_first = True)
         else:
@@ -5806,6 +5813,10 @@ class DynamicsWorldModel(Module):
             latents = rearrange(latents, 'b t v d -> b t v 1 d') # 1 latent edge case
 
         assert latents.shape[-2:] == self.latent_shape, f'latents must have shape {self.latent_shape}, got {latents.shape[-2:]}'
+
+        # keep latents in fp32 for the flow-matching / diffusion math (noise, times,
+        # velocity targets); autocast still runs the transformer matmuls in bf16
+        latents = latents.float()
         assert latents.shape[2] == self.num_video_views, f'latents must have {self.num_video_views} views, got {latents.shape[2]}'
 
         # variables
