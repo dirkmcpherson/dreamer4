@@ -1,0 +1,18 @@
+# accelerate launch config for a single H200 node (multi-GPU DDP, bf16).
+# Override --num_processes on the CLI to match GPUs on the node.
+# For multi-node, see infra/README.md (set num_machines / machine_rank / main_process_ip).
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8          # GPUs on the node; override per node type
+machine_rank: 0
+gpu_ids: all
+rdzv_backend: static
+same_network: true
+main_training_function: main
+downcast_bf16: 'no'
+enable_cpu_affinity: true
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

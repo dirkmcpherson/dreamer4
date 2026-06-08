@@ -2,6 +2,9 @@
 data/
 logs_*/
 
+# Claude Code local settings
+.claude/settings.local.json
+
 logs/
 
 # Byte-compiled / optimized / DLL files

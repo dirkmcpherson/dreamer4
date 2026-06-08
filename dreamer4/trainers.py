@@ -99,6 +99,8 @@ class VideoTokenizerTrainer(Module):
         num_train_steps = 10_000,
         grad_accum_every = 1,
         weight_decay = 0.,
+        num_workers = 0,
+        pin_memory = False,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
@@ -166,7 +168,7 @@ class VideoTokenizerTrainer(Module):
         self.checkpoint_path = checkpoint_path
 
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
+        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, num_workers = num_workers, pin_memory = pin_memory, persistent_workers = num_workers > 0)
 
         optim_kwargs = dict(
             lr = learning_rate,
@@ -334,10 +336,11 @@ class VideoTokenizerTrainer(Module):
                 latent_ar_loss = losses.latent_ar.item()
             )
 
-            if self.log_video_flag and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
+            if self.log_video_flag and self.log_video_every > 0 and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
 
                 sample_model = self.ema_model.ema_model if self.use_ema else self.model
 
+                was_training = sample_model.training
                 sample_model.eval()
 
                 with torch.no_grad():
@@ -350,6 +353,8 @@ class VideoTokenizerTrainer(Module):
                 recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
                 self.log_video(recon_video, "reconstructed_video")
+
+                sample_model.train(was_training)
 
                 if exists(self.results_folder):
                     combined_video = torch.cat((video, recon_video), dim = -1)
@@ -435,6 +440,8 @@ class BehaviorCloneTrainer(Module):
         max_grad_norm = 0.5,
         num_train_steps = 10_000,
         weight_decay = 0.,
+        num_workers = 0,
+        pin_memory = False,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
@@ -487,7 +494,7 @@ class BehaviorCloneTrainer(Module):
 
         self.model = model
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn)
+        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn, num_workers = num_workers, pin_memory = pin_memory, persistent_workers = num_workers > 0)
 
         self.custom_sample_fn = custom_sample_fn
 
@@ -881,7 +888,7 @@ class BehaviorCloneTrainer(Module):
 
             self.accelerator.wait_for_everyone()
 
-            if self.is_main_process and self.log_video_flag and divisible_by(self.step.item(), self.log_video_every):
+            if self.is_main_process and self.log_video_flag and self.log_video_every > 0 and divisible_by(self.step.item(), self.log_video_every):
                 self.sample(batch_data)
 
             if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):

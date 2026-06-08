@@ -77,7 +77,8 @@ def main(
     attn_heads = 8,
     use_ema = True,
     ema_decay = 0.99,
-    log_video_every = 50,
+    log_video_every = 1000,
+    logger = 'wandb',  # 'wandb' or 'tensorboard'
     log_dir = './logs_mnist_tokenizer',
     checkpoint_every = 5000,
     checkpoint_folder = './logs_mnist_tokenizer/checkpoints',
@@ -191,6 +192,12 @@ def main(
         slot_attention_inverted = slot_attention_inverted
     )
 
+    # logging backend
+
+    assert logger in ('wandb', 'tensorboard'), "logger must be 'wandb' or 'tensorboard'"
+    use_wandb = logger == 'wandb'
+    use_tensorboard = logger == 'tensorboard'
+
     # trainer
 
     trainer = VideoTokenizerTrainer(
@@ -202,7 +209,8 @@ def main(
         grad_accum_every = grad_accum_every,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_wandb = True,
+        use_wandb = use_wandb,
+        use_tensorboard = use_tensorboard,
         log_dir = log_dir,
         log_video = True,
         video_fps = 4,

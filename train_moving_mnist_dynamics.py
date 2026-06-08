@@ -112,7 +112,8 @@ def main(
     attn_heads = 8,
     use_ema = True,
     video_fps = 4,
-    log_video_every = 100,
+    log_video_every = 1000,
+    logger = 'wandb',  # 'wandb' or 'tensorboard'
     log_dir = './logs_mnist_dynamics',
     checkpoint_every = 5000,
     checkpoint_folder = './logs_mnist_dynamics/checkpoints',
@@ -208,6 +209,12 @@ def main(
         latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None
     )
 
+    # logging backend
+
+    assert logger in ('wandb', 'tensorboard'), "logger must be 'wandb' or 'tensorboard'"
+    use_wandb = logger == 'wandb'
+    use_tensorboard = logger == 'tensorboard'
+
     # initialize trainer
 
     trainer = BehaviorCloneTrainer(
@@ -216,7 +223,8 @@ def main(
         batch_size = batch_size,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_tensorboard = True,
+        use_wandb = use_wandb,
+        use_tensorboard = use_tensorboard,
         log_dir = log_dir,
         video_fps = video_fps,
         log_video_every = log_video_every,
