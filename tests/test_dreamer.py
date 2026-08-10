@@ -2978,3 +2978,108 @@ def test_dynamics_model_all_three_tokenizers_sequential_parallel_cache(use_time_
     )
 
     assert exists(generated_outputs)
+
+def test_audio_tokenizer_arbitrary_lengths():
+    pytest.importorskip('torchaudio')
+    from dreamer4.dreamer4 import AudioTokenizer
+
+    common_kwargs = dict(
+        dim = 32,
+        dim_latent = 16,
+        sample_rate = 16000,
+        n_fft = 400,
+        hop_length = 160,
+        n_mels = 16,
+        num_latent_tokens = 4,
+        image_size = 16,
+        patch_size = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8
+    )
+
+    tokenizer = AudioTokenizer(**common_kwargs)
+
+    # mel time frames = samples // hop + 1, which is not always divisible by patch_size - the tokenizer must handle any audio length
+
+    for samples in (2400, 2300, 4321, 5000):
+        audio = torch.randn(2, 1, samples)
+
+        loss = tokenizer(audio)
+        assert torch.isfinite(loss), f'loss should be finite for {samples} samples'
+
+        latents = tokenizer(audio, return_latents = True)
+        recon = tokenizer.decode(latents, audio_len = samples)
+        assert recon.shape == audio.shape, (recon.shape, audio.shape)
+
+    # flow decoder path
+
+    flow_tokenizer = AudioTokenizer(**common_kwargs, flow_noise_std = 1., decoder_flow_steps = 4)
+
+    audio = torch.randn(2, 1, 2300)
+
+    loss = flow_tokenizer(audio)
+    assert torch.isfinite(loss)
+
+    latents = flow_tokenizer(audio, return_latents = True)
+    recon = flow_tokenizer.decode(latents, audio_len = 2300)
+    assert recon.shape == audio.shape
+
+    recon, recons_across_steps = flow_tokenizer.decode(latents, audio_len = 2300, return_recons_across_steps = True)
+    assert recon.shape == audio.shape
+    assert all([r.shape == audio.shape for r in recons_across_steps])
+
+    # stereo audio
+
+    stereo_tokenizer = AudioTokenizer(channels = 2, **common_kwargs)
+
+    stereo_audio = torch.randn(2, 2, 4321)
+    loss = stereo_tokenizer(stereo_audio)
+    assert torch.isfinite(loss)
+
+    recon = stereo_tokenizer.decode(stereo_tokenizer(stereo_audio, return_latents = True), audio_len = 4321)
+    assert recon.shape == stereo_audio.shape
+
+    # the default lpips loss (vgg) assumes 3 channel rgb input, so it cannot be used for audio - it must be explicitly disabled, unless a custom lpips network is passed in
+
+    with pytest.raises(AssertionError):
+        AudioTokenizer(**common_kwargs, lpips_loss_weight = 0.2)
+
+    custom_tokenizer = AudioTokenizer(
+        **common_kwargs,
+        lpips_loss_weight = 0.2,
+        lpips_loss_network = torch.nn.Identity()
+    )
+
+    assert custom_tokenizer.has_lpips_loss
+
+def test_combine_experiences_with_different_lens():
+    from dreamer4.dreamer4 import Experience, Actions, combine_experiences
+
+    def make_exp(time, rewards = 'default'):
+        return Experience(
+            latents = torch.randn(2, time, 3, 8),
+            rewards = torch.randn(2, time) if rewards == 'default' else rewards,
+            actions = Actions(
+                discrete = torch.randint(0, 3, (2, time, 1)),
+                continuous = torch.randn(2, time, 1)
+            ),
+            values = torch.randn(2, time),
+            step_size = 1,
+            agent_index = 0
+        )
+
+    combined = combine_experiences([make_exp(4), make_exp(6)])
+
+    assert combined.latents.shape == (4, 6, 3, 8)
+    assert combined.rewards.shape == (4, 6)
+    assert combined.actions.discrete.shape == (4, 6, 1)
+    assert combined.actions.continuous.shape == (4, 6, 1)
+    assert combined.lens.tolist() == [4, 4, 6, 6]
+    assert combined.is_truncated.tolist() == [True, True, True, True]
+
+    # a field that is a tensor in one experience and None in another should raise a clean assertion error
+
+    with pytest.raises(AssertionError):
+        combine_experiences([make_exp(4), make_exp(4, rewards = None)])

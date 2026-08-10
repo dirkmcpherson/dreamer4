@@ -320,10 +320,13 @@ def combine_experiences(
 
     # an assert to make sure all fields are either all tensors, or a single matching value (for step size, agent index etc) - can change this later
 
-    assert all([
-        all([is_tensor(v) for v in field_values]) or len(set(field_values)) == 1
-        for field_values in all_field_values
-    ])
+    for field_values in all_field_values:
+        if all([is_tensor(v) for v in field_values]):
+            continue
+
+        assert all([not is_tensor(v) for v in field_values]), 'each field must be either all tensors or all non-tensors across experiences, but got a mix for one field'
+
+        assert len(set(field_values)) == 1, 'non tensor fields must all have the same value across experiences'
 
     concatted = []
 
@@ -4953,10 +4956,16 @@ class AudioTokenizer(SpaceTimeTokenizer):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = default(win_length, n_fft)
+        self.n_mels = n_mels
+
+        # the default lpips loss assumes 3 channel (rgb) input, which does not hold for audio - require a custom lpips network (e.g. audio lpips) if the loss is to be used
+
+        if not exists(kwargs.get('lpips_loss_network')):
+            assert kwargs.get('lpips_loss_weight', 0.) == 0., 'audio lpips requires a custom network, as the default assumes rgb input'
+            kwargs.setdefault('lpips_loss_weight', 0.)
 
         super().__init__(channels = channels, **kwargs)
 
-        check_import('torchaudio', 'torchaudio is required')
         from torchaudio.transforms import MelSpectrogram, InverseMelScale, GriffinLim
 
         self.mel_spec = MelSpectrogram(
@@ -4970,7 +4979,8 @@ class AudioTokenizer(SpaceTimeTokenizer):
         self.inverse_mel = InverseMelScale(
             n_stft = n_fft // 2 + 1,
             n_mels = n_mels,
-            sample_rate = sample_rate
+            sample_rate = sample_rate,
+            driver = 'gelsy'
         )
 
         self.griffin_lim = GriffinLim(
@@ -4979,22 +4989,94 @@ class AudioTokenizer(SpaceTimeTokenizer):
             hop_length = hop_length
         )
 
+    @property
+    def mel_height(self):
+        return self.n_mels + (-self.n_mels) % self.patch_size
+
+    def num_frames(self, audio_len):
+        return audio_len // self.hop_length + 1
+
     def _audio_to_freq_time(self, audio):
         audio, unpack_inverse = pack_one(audio, '* samples')
+
+        # pad the samples so the mel time frames are divisible by `patch_size`
+
+        frames = self.num_frames(audio.shape[-1])
+        pad_frames = (-frames) % self.patch_size
+
+        audio = pad_right_at_dim(audio, pad_frames * self.hop_length, dim = -1)
+
         mel = self.mel_spec(audio)
+
+        # pad the mel frequency axis so it is divisible by `patch_size` as well
+
+        pad_n_mels = self.mel_height - self.n_mels
+
+        mel = pad_right_at_dim(mel, pad_n_mels, dim = -2)
+
         return unpack_inverse(mel, '* n_mels time_frames')
 
-    def _freq_time_to_audio(self, freq_time):
+    def _freq_time_to_audio(self, freq_time, audio_len = None):
         freq_time, unpack_inverse = pack_one(freq_time, '* n_mels time_frames')
+
+        # strip mel frequency and time padding
+
+        freq_time = freq_time[..., :self.n_mels, :]
+
+        if exists(audio_len):
+            frames = self.num_frames(audio_len)
+            freq_time = freq_time[..., :frames]
+
         stft = self.inverse_mel(freq_time)
         audio = self.griffin_lim(stft)
-        return unpack_inverse(audio, '* samples')
+
+        # have the audio be of the exact original length if given
+
+        if exists(audio_len):
+            audio = pad_right_at_dim_to(audio[..., :audio_len], audio_len, dim = -1)
+
+        audio = unpack_inverse(audio, '* samples')
+
+        # tokenizer treats mel as an image, adding a time dimension of 1 - squeeze it back out for standalone case
+
+        if audio.ndim == 4 and audio.shape[-2] == 1:
+            audio = rearrange(audio, 'b c 1 s -> b c s')
+
+        return audio
+
+    def decode(
+        self,
+        latents,
+        height = None,
+        width = None,
+        aug_id = None,
+        return_recons_across_steps = False,
+        audio_len = None
+    ):
+        # the mel frequency axis, padded to be divisible by `patch_size`, mirroring `_audio_to_freq_time`
+
+        height = default(height, self.mel_height)
+
+        # the number of mel time frames cannot be inferred from the latents - derive it from the audio length, if given
+
+        if not exists(width):
+            assert exists(audio_len), 'width or audio_len must be provided for audio decoding, as the number of mel frames cannot be inferred from the latents'
+
+            frames = self.num_frames(audio_len)
+            width = frames + (-frames) % self.patch_size
+
+        recon = super().decode(latents, height = height, width = width, aug_id = aug_id, return_recons_across_steps = return_recons_across_steps)
+
+        if return_recons_across_steps:
+            recon, all_pred_videos = recon
+            recon = self._freq_time_to_audio(recon, audio_len = audio_len)
+            all_pred_videos = [self._freq_time_to_audio(video, audio_len = audio_len) for video in all_pred_videos]
+            return recon, all_pred_videos
+
+        return self._freq_time_to_audio(recon, audio_len = audio_len)
 
     def forward(self, audio, *args, **kwargs):
         return super().forward(self._audio_to_freq_time(audio), *args, **kwargs)
-
-    def decode(self, latents, *args, **kwargs):
-        return self._freq_time_to_audio(super().decode(latents, *args, **kwargs))
 
 # self-flow distillation - Chefer et al. https://arxiv.org/abs/2603.06507
 
