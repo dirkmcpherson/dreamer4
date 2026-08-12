@@ -740,6 +740,9 @@ class LPIPSLoss(Module):
             vgg = torchvision.models.vgg16(weights = vgg_weights)
             vgg.classifier = Sequential(*vgg.classifier[:-2])
 
+        vgg = vgg.eval()
+        vgg.requires_grad_(False)
+
         self.vgg = [vgg]
         self.sampled_frames = sampled_frames
 
@@ -3557,6 +3560,7 @@ class VideoDecoderNetwork(Module):
         self,
         dim,
         dim_latent,
+        num_latent_tokens,
         patch_size,
         channels,
         depth,
@@ -3576,6 +3580,7 @@ class VideoDecoderNetwork(Module):
         time_attention_use_pope,
         space_attention_use_pope,
         full_spatial_attn = False,
+        special_attend_only_itself = True,
         decoder_pos_emb_mlp_activation: Activation = 'silu',
         decoder_pos_mlp_depth = 2,
         image_height = None,
@@ -3654,6 +3659,8 @@ class VideoDecoderNetwork(Module):
             space_height = num_patch_height,
             space_width = num_patch_width,
             full_spatial_attn = full_spatial_attn,
+            num_special_tokens = num_latent_tokens + int(has_aug_conditioning),
+            special_attend_only_itself = special_attend_only_itself,
             time_attention_use_pope = time_attention_use_pope,
             space_attention_use_pope = space_attention_use_pope
         )
@@ -4291,6 +4298,7 @@ class SpaceTimeTokenizer(Module):
         decoder_kwargs = dict(
             dim = dim,
             dim_latent = dim_latent,
+            num_latent_tokens = num_latent_tokens,
             patch_size = patch_size,
             channels = channels,
             depth = decoder_depth,
@@ -7411,17 +7419,17 @@ class DynamicsWorldModel(Module):
 
             video = unpack_view(video, '* t c vh vw')
 
-        # remove the lone view dimension
+        # remove the lone view dimension on video, and on latents unless an experience is returned
 
-        if not self.video_has_multi_view:
-            latents = rearrange(latents, 'b t 1 ... -> b t ...')
-
-            if exists(video):
-                video = rearrange(video, 'b 1 ... -> b ...')
+        if not self.video_has_multi_view and exists(video):
+            video = rearrange(video, 'b 1 ... -> b ...')
 
         # only return video or latent if not requesting anything else, for first stage training
 
         if not has_at_least_one(return_rewards_per_frame, return_agent_actions, has_proprio):
+            if not self.video_has_multi_view:
+                latents = rearrange(latents, 'b t 1 ... -> b t ...')
+
             out = video if return_decoded_video else latents
 
             if not return_time_cache:
