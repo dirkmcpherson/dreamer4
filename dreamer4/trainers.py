@@ -22,7 +22,7 @@ import numpy as np
 import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
-from torch_einops_utils import shape_with_replace, pad_right_at_dim, pad_left_at_dim
+from torch_einops_utils import shape_with_replace, pad_right_at_dim, pad_left_at_dim, temp_eval
 from torch_einops_utils.save_load import dehydrate_config
 
 from pathlib import Path
@@ -710,9 +710,7 @@ class VideoTokenizerTrainer(Module):
 
                 sample_model = self.ema_model.ema_model if self.use_ema else self.model
 
-                sample_model.eval()
-
-                with torch.no_grad():
+                with temp_eval(sample_model), torch.no_grad():
                     video_height, video_width = video.shape[-2:]
 
                     if self.model.has_flow:

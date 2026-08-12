@@ -429,7 +429,7 @@ def test_action_embedder():
     )
 
     discrete_actions = torch.randint(0, 4, (2, 3, 2))
-    continuous_actions = torch.randn(2, 3, 2)
+    continuous_actions = torch.rand(2, 3, 2) # within beta support of (0, 1)
 
     action_embed = embedder(discrete_actions = discrete_actions, continuous_actions = continuous_actions)
 

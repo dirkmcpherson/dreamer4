@@ -1251,7 +1251,8 @@ class ActionEmbedder(Module):
                 continuous_mean_std = tensor(continuous_norm_stats) if self.continuous_need_norm else None,
                 continuous_dist_type = readout_dist_type,
                 continuous_dist_kwargs = continuous_dist_kwargs,
-                continuous_squashed = readout_squashed
+                continuous_squashed = readout_squashed,
+                eps = self.beta_log_prob_eps
             )
 
         # defaults
@@ -1495,13 +1496,15 @@ class ActionEmbedder(Module):
                 if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 2):
                     continuous_targets = rearrange(continuous_targets, '... -> 1 ...')
 
-            if soft_validate_range and self.continuous_dist_type == 'beta':
-                continuous_targets = continuous_targets.clamp(self.beta_log_prob_eps, 1. - self.beta_log_prob_eps)
+            # only clamp for beta distribution, and do it after any normalization
+            # (in the readout) - clamping before normalization would silently corrupt
+            # raw targets that are outside of (0, 1) but normalize into the valid range
 
             continuous_log_probs = self.continuous_readout.log_prob_continuous(
                 continuous_action_mean_log_var,
                 continuous_targets,
-                selector = self.continuous_readout.get_selector()
+                selector = self.continuous_readout.get_selector(),
+                soft_validate_range = soft_validate_range and self.continuous_dist_type == 'beta'
             )
 
             if return_entropies:
@@ -5249,6 +5252,7 @@ class DynamicsWorldModel(Module):
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
         tem_loss_weight = 1.,
+        h_net_loss_weight = 1.,
         actor_spr = False,
         actor_nlp_kwargs = dict(),
         policy_head_mlp_activation: Activation = 'silu',
@@ -5499,6 +5503,7 @@ class DynamicsWorldModel(Module):
         self.lapo_fdm_loss_weight = lapo_fdm_loss_weight
         self.lapo_raw_latent_fdm_loss_weight = lapo_raw_latent_fdm_loss_weight
         self.tem_loss_weight = tem_loss_weight
+        self.h_net_loss_weight = h_net_loss_weight
 
         self.latent_ar = None
 
@@ -8488,6 +8493,10 @@ class DynamicsWorldModel(Module):
         else:
             tem_pred_latents = None
 
+        # h-net ratio loss - across all configured transformers
+
+        h_net_loss = sum((i.h_net_loss for i in filter(exists, (intermediates.main, intermediates.actor, intermediates.critic, intermediates.spatial, intermediates.action))), self.zero)
+
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
         total_loss = (
@@ -8506,10 +8515,11 @@ class DynamicsWorldModel(Module):
             (lapo_action_loss * self.lapo_action_loss_weight) +
             (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
             (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
-            (tem_loss * self.tem_loss_weight)
+            (tem_loss * self.tem_loss_weight) +
+            (h_net_loss * self.h_net_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, h_net_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss
