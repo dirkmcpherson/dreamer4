@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.19.0"
+version = "0.19.1"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -35,7 +35,7 @@ dependencies = [
     "ema-pytorch",
     "env-ssl-wrapper>=0.1.8",
     "fire",
-    "hl-gauss-pytorch",
+    "hl-gauss-pytorch>=0.2.7",
     "h-net-dynamic-chunking>=0.5.12",
     "imageio",
     "imageio-ffmpeg",
