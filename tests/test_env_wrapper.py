@@ -220,7 +220,7 @@ def test_stacked_wrappers(temp_record_dir, real_replay_buffer, rewards, terminat
     for key in keys:
         sig_buf1 = np.asarray(buffer1.dataset(slice_by_episode_len = True)[0][key])
         sig_fol1 = np.load(temp_record_dir / "order1" / f"episode_0.{key}.npy")
-        assert np.allclose(sig_buf1[:-1], sig_fol1)
+        assert np.allclose(sig_buf1, sig_fol1)
 
     for sig_key in kwargs['dotpaths'].keys():
         sig_buf1 = np.asarray(buffer1.dataset(slice_by_episode_len = True)[0][sig_key])
@@ -251,7 +251,7 @@ def test_stacked_wrappers(temp_record_dir, real_replay_buffer, rewards, terminat
     for key in keys:
         sig_buf2 = np.asarray(buffer2.dataset(slice_by_episode_len = True)[0][key])
         sig_fol2 = np.load(temp_record_dir / "order2" / f"episode_0.{key}.npy")
-        assert np.allclose(sig_buf2[:-1], sig_fol2)
+        assert np.allclose(sig_buf2, sig_fol2)
 
     for sig_key in kwargs['dotpaths'].keys():
         sig_buf2 = np.asarray(buffer2.dataset(slice_by_episode_len = True)[0][sig_key])

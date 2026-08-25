@@ -15,7 +15,6 @@ from pathlib import Path
 
 import torch
 import numpy as np
-from einops import rearrange
 from joblib import Parallel, delayed
 
 import gymnasium as gym
@@ -58,8 +57,10 @@ class GymWrapper(gym.Env):
         self.observation_space = spaces.Box(low=0, high=255, shape=(3, sz, sz), dtype=np.uint8)
 
     def _get_obs(self, obs_dict):
+        # SnakeEnv's canonical observation layout is channel-first (c h w);
+        # forward it as-is, only converting to uint8 to match the observation space
         img = obs_dict['image']
-        return rearrange(img, 'h w c -> c h w')
+        return np.clip(img, 0, 255).astype(np.uint8)
 
     def reset(self, seed = None, options = None):
         super().reset(seed = seed)

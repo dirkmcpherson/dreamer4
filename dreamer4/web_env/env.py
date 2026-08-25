@@ -1,7 +1,12 @@
 import numpy as np
-from einops import rearrange
 
 class SnakeEnv:
+    """Toy snake environment.
+
+    Observations are returned as dicts with an `image` key, channel-first
+    `(3, H, W)` float32 arrays with values in [0, 255]. All consumers must
+    rely on this single canonical layout - no transposing at the call site.
+    """
     def __init__(
         self,
         *,
@@ -81,14 +86,17 @@ class SnakeEnv:
 
     def _render(self):
         c = self.render_cell_size
-        img = np.zeros((self.grid_size * c, self.grid_size * c, 3), dtype = np.uint8)
+        size = self.grid_size * c
+
+        # channel-first (c h w), values in [0, 255]
+        img = np.zeros((3, size, size), dtype = np.uint8)
 
         fx, fy = self.food
-        img[fy*c:(fy+1)*c, fx*c:(fx+1)*c, 0] = 255
+        img[0, fy*c:(fy+1)*c, fx*c:(fx+1)*c] = 255
 
         for i, (sx, sy) in enumerate(self.snake):
             y1, y2, x1, x2 = sy*c, (sy+1)*c, sx*c, (sx+1)*c
-            img[y1:y2, x1:x2, 1] = 255 if i == 0 else 200
+            img[1, y1:y2, x1:x2] = 255 if i == 0 else 200
 
             if i == 0:
                 half_c = max(1, c // 2)
@@ -97,8 +105,6 @@ class SnakeEnv:
                 elif self.direction == 2: slice_y, slice_x = slice(y2-half_c, y2), slice(x1, x2)
                 elif self.direction == 3: slice_y, slice_x = slice(y1, y2), slice(x1, x1+half_c)
 
-                img[slice_y, slice_x, :] = 255
+                img[:, slice_y, slice_x] = 255
 
-        img = img.astype(np.float32)
-        img = rearrange(img, 'h w c -> c h w')
-        return img
+        return img.astype(np.float32)

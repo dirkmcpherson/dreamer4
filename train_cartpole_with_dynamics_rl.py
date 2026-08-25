@@ -241,6 +241,7 @@ class TransformerPPOAgent(nn.Module):
             attn_heads = 4,
             attn_dim_head = 16,
             reward_encoder_kwargs = dict(reward_range = (-10., 10.)),
+            value_encoder_kwargs = dict(reward_range = (-20., 150.)),
             dim_critic_state = 4 if use_asym_critic else None,
             pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
             agent_predicts_state = agent_predicts_latent,
@@ -289,10 +290,11 @@ def main(
     update_episodes = 16,
     update_epochs = 4,
     ppo_replay_updates = 2,
-    max_timesteps = 150,
+    max_batches_per_epoch = 800,
+    max_timesteps = 500,
     learning_rate = 3e-4,
     max_grad_norm = 0.5,
-    target_return = 70.0,
+    target_return = 450.0,
     use_asym_critic = True,
     agent_value_gradient_frac = 0.1,
     agent_policy_gradient_frac = 1.0,
@@ -533,9 +535,12 @@ def main(
                     return_mask = False
                 )
 
-                num_batches = len(dataloader)
+                num_batches = min(len(dataloader), max_batches_per_epoch)
 
                 for i, batch_dict in enumerate(dataloader):
+                    if i >= max_batches_per_epoch:
+                        break
+
                     micro = Experience.from_buffer_dict(batch_dict).to(device)
 
                     if agent.dynamics.has_image_encoder:

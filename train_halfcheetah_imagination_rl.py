@@ -1151,7 +1151,8 @@ def main(
                         exp,
                         memmap_path,
                         max_episodes = replay_size * num_envs,
-                        max_timesteps = max_timesteps + 10
+                        max_timesteps = max_timesteps + 10,
+                        circular = True
                     )
 
                 for single_exp in exp.unbind():

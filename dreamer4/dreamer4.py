@@ -6117,56 +6117,49 @@ class DynamicsWorldModel(Module):
     ):
         device = self.device
 
+        from env_ssl_wrapper import (
+            ActionTransformWrapper,
+            AutoBatchedWrapper,
+            EpisodePaddingWrapper,
+            StandardizeWrapper,
+            TensorWrapper,
+            TimeLimitWrapper
+        )
+
+        # normalize the environment into a single canonical contract:
+        # standardized step outputs, continuous action rescaling, episode
+        # length capping, torch tensors on device, and a consistent batch dim
+
+        env = StandardizeWrapper(env)
+
         if self.action_embedder.has_continuous_actions and exists(self.action_embedder.continuous_target_action_range):
-            def transform_fn(action):
-                is_tuple = isinstance(action, tuple)
-                discrete, continuous = action if is_tuple else (None, action)
+            native_range = self.action_embedder.continuous_readout.get_continuous_native_range()
 
-                continuous_tensor = cast_to_tensor(continuous, device)
-                scaled_continuous = self.action_embedder.rescale_for_env(continuous_tensor)
-                scaled_continuous = scaled_continuous.cpu().numpy()
-
-                return (discrete, scaled_continuous) if is_tuple else scaled_continuous
-
-            if hasattr(env, 'wrap_innermost'):
-                from dreamer4.env import ActionTransformWrapper
-
-                env.wrap_innermost(
-                    ActionTransformWrapper,
-                    transform_fn = transform_fn,
+            if exists(native_range):
+                env = ActionTransformWrapper(
+                    env,
+                    transforms = [dict(rescale_from_to = (native_range, self.action_embedder.continuous_target_action_range))],
                     clip = self.action_embedder.continuous_target_action_range
                 )
 
-        init_obs = env.reset(seed = seed)
+        if env_is_vectorized:
+            env = EpisodePaddingWrapper(env)
 
-        if isinstance(init_obs, tuple):
-            init_obs = init_obs[0]
+        env = TimeLimitWrapper(env, max_timesteps = max_timesteps)
+        env = TensorWrapper(env, device = device)
+        env = AutoBatchedWrapper(env, is_vector = env_is_vectorized)
+
+        init_obs, _ = env.reset(seed = seed)
 
         if not isinstance(init_obs, dict):
-            if not is_tensor(init_obs):
-                init_obs = cast_to_tensor(init_obs, device, dtype = torch.float32)
-            if init_obs.ndim >= 3:
-                init_obs = dict(image = init_obs)
-            else:
-                init_obs = dict(state = init_obs)
+            init_obs = dict(image = init_obs) if init_obs.ndim >= 3 else dict(state = init_obs)
 
         assert 'image' in init_obs or 'state' in init_obs
         assert not self.has_proprio or 'proprio' in init_obs
 
-        proprio = init_obs.get('proprio', None)
-
-        if env_is_vectorized:
-            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in init_obs else None
-            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'b d -> b 1 d')
-            state_frame = init_obs.get('state', None)
-            if exists(state_frame):
-                state_frame = cast_to_tensor(state_frame, device, dtype = torch.float32)
-        else:
-            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in init_obs else None
-            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'd -> 1 1 d')
-            state_frame = init_obs.get('state', None)
-            if exists(state_frame):
-                state_frame = rearrange(cast_to_tensor(state_frame, device, dtype = torch.float32), 'd -> 1 d')
+        image_frame = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw') if 'image' in init_obs else None
+        state_frame = init_obs.get('state', None)
+        accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'b d -> b 1 d')
 
         batch = image_frame.shape[0] if exists(image_frame) else state_frame.shape[0]
 
@@ -6205,15 +6198,11 @@ class DynamicsWorldModel(Module):
         time_cache = None
         tokenizer_time_cache = None
 
-        step_index = 0
-
         obs = init_obs
         curr_image = image_frame
         curr_state = state_frame
 
         while not done_flag.all():
-            step_index += 1
-
             if exists(obs_to_latents_fn):
                 latents, next_tokenizer_time_cache = obs_to_latents_fn(self, obs, tokenizer_time_cache)
 
@@ -6329,41 +6318,16 @@ class DynamicsWorldModel(Module):
             else:
                 action_out = (sampled_discrete_actions, env_continuous_actions)
 
-            if env_is_vectorized:
-                action_out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), action_out)
-            else:
-                action_out = tree_map_tensor(lambda t: rearrange(t, '1 1 ... -> ...'), action_out)
+            action_out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), action_out)
 
-            action_out = tree_map_tensor(lambda t: t.cpu().numpy(), action_out)
+            next_obs, reward, terminated, truncated, _ = env.step(action_out)
 
-            if not env_is_vectorized and not exists(sampled_continuous_actions) and getattr(action_out, 'size', None) == 1:
-                action_out = int(action_out.item())
-
-            env_step_out = env.step(action_out)
-
-            if len(env_step_out) == 2:
-                next_obs, reward = env_step_out
-                terminated = full((batch,), False, device = device)
-                truncated = full((batch,), False, device = device)
-            elif len(env_step_out) == 3:
-                next_obs, reward, terminated = env_step_out
-                truncated = full((batch,), False, device = device)
-            elif len(env_step_out) == 4:
-                next_obs, reward, terminated, truncated = env_step_out
-            elif len(env_step_out) == 5:
-                next_obs, reward, terminated, truncated, info = env_step_out
-
-            terminated = cast_to_tensor(terminated, device).view((batch,))
-            truncated = cast_to_tensor(truncated, device).view((batch,))
-            reward = cast_to_tensor(reward, device, dtype = torch.float32)
+            terminated = terminated.view((batch,))
+            truncated = truncated.view((batch,))
+            reward = rearrange(reward, 'b -> b 1')
 
             if not isinstance(next_obs, dict):
-                if not is_tensor(next_obs):
-                    next_obs = cast_to_tensor(next_obs, device, dtype=torch.float32)
-                if next_obs.ndim >= 3:
-                    next_obs = dict(image = next_obs)
-                else:
-                    next_obs = dict(state = next_obs)
+                next_obs = dict(image = next_obs) if next_obs.ndim >= 3 else dict(state = next_obs)
 
             assert 'image' in next_obs or 'state' in next_obs
 
@@ -6371,13 +6335,9 @@ class DynamicsWorldModel(Module):
 
             is_terminated |= terminated
             is_truncated |= truncated
-            if step_index >= max_timesteps:
-                is_truncated |= ~is_terminated
 
             was_terminated |= terminated
             done_flag |= (is_terminated | is_truncated)
-
-            reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
 
             # maybe state entropy bonus
 
@@ -6393,40 +6353,26 @@ class DynamicsWorldModel(Module):
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             obs = next_obs
-            next_proprio = obs.get('proprio')
 
-            # handle fetching new states and images
+            # handle fetching new states and images (always batched)
 
             curr_state = None
 
-            if env_is_vectorized:
-                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in obs else None
+            curr_image = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw') if 'image' in obs else None
 
-                if 'state' in obs:
-                    curr_state = cast_to_tensor(obs['state'], device, dtype = torch.float32)
+            if 'state' in obs:
+                curr_state = obs['state']
 
-                next_proprio = maybe(rearrange)(next_proprio, 'b d -> b 1 d')
-            else:
-                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in obs else None
-
-                if 'state' in obs:
-                    curr_state = rearrange(cast_to_tensor(obs['state'], device, dtype = torch.float32), 'd -> 1 d')
-
-                next_proprio = maybe(rearrange)(next_proprio, 'd -> 1 1 d')
+            next_proprio = maybe(rearrange)(obs.get('proprio', None), 'b d -> b 1 d')
 
             if exists(next_proprio):
-                next_proprio = cast_to_tensor(next_proprio, device, dtype = torch.float32)
                 accumulated_proprio = safe_cat((accumulated_proprio, next_proprio), dim=1)
 
             if exists(curr_state):
                 state_frame = curr_state
 
             if exists(state_frame):
-                if not is_tensor(state_frame):
-                    state_frame = tensor(state_frame, dtype = torch.float32, device = device)
-                else:
-                    state_frame = state_frame.to(device)
-
+                state_frame = state_frame.to(device)
                 states.append(state_frame)
 
             if exists(curr_image):
@@ -6451,7 +6397,7 @@ class DynamicsWorldModel(Module):
 
                 elif exists(curr_state):
                     if exists(self.state_tokenizer):
-                        bootstrap_latents = self.state_tokenizer(curr_state)
+                        bootstrap_latents = self.state_tokenizer(curr_state, return_latents = True)
                     else:
                         bootstrap_latents = self.state_to_latents(curr_state)
 
@@ -6841,7 +6787,7 @@ class DynamicsWorldModel(Module):
 
             # spo clipped surrogate loss
 
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = (log_probs - old_log_probs).clamp(-20., 20.).exp()
 
             policy_loss = -(
                 ratio * advantage -
@@ -6857,7 +6803,11 @@ class DynamicsWorldModel(Module):
 
             # ppo clipped surrogate loss
 
-            ratio = (log_probs - old_log_probs).exp()
+            # clamp the log ratio before exponentiating, as near-deterministic
+            # policies can sample actions with extreme log probs, blowing the
+            # ratio up to inf and the loss to nan
+
+            ratio = (log_probs - old_log_probs).clamp(-20., 20.).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
             policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)

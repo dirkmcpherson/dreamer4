@@ -2,7 +2,7 @@ from __future__ import annotations
 from random import choice
 
 import torch
-from torch import tensor, empty, randn, randint
+from torch import tensor, empty, randn, randint, full
 from torch.nn import Module
 
 from einops import repeat
@@ -30,7 +30,7 @@ class MockEnv(Module):
         self.image_shape = image_shape
         self.reward_range = reward_range
 
-        self.num_envs = num_envs
+        self.num_envs = num_envs if vectorized else 1
         self.vectorized = vectorized
         assert not (vectorized and num_envs == 1)
 
@@ -75,26 +75,19 @@ class MockEnv(Module):
             state = repeat(state, '... -> b ...', b = self.num_envs)
             reward = repeat(reward, ' -> b', b = self.num_envs)
 
-        out = (state, reward)
+        shape = (self.num_envs,) if self.vectorized else ()
+        valid_step = self._step > self.terminate_after_step if self.can_terminate else full(shape, True, dtype = torch.bool)
 
+        terminated = (torch.rand(shape) < self.rand_terminate_prob) & valid_step if self.can_terminate else full(shape, False, dtype = torch.bool)
 
-        if self.can_terminate:
-            shape = (self.num_envs,) if self.vectorized else (1,)
-            valid_step = self._step > self.terminate_after_step
+        truncated = full(shape, False, dtype = torch.bool)
 
-            terminate = (torch.rand(shape) < self.rand_terminate_prob) & valid_step
-
-            out = (*out, terminate)
-
-            # maybe truncation
-
-            if self.can_truncate:
-                truncate = (torch.rand(shape) < self.rand_truncate_prob) & valid_step & ~terminate
-                out = (*out, truncate)
+        if self.can_truncate:
+            truncated = (torch.rand(shape) < self.rand_truncate_prob) & valid_step & ~terminated
 
         self._step.add_(1)
 
-        return out
+        return state, reward, terminated, truncated, dict()
 
 class MockDictEnv(Module):
     def __init__(
@@ -108,7 +101,7 @@ class MockDictEnv(Module):
         super().__init__()
         self.image_shape = image_shape
         self.dim_proprio = dim_proprio
-        self.num_envs = num_envs
+        self.num_envs = num_envs if vectorized else 1
         self.vectorized = vectorized
         self.terminate_after_step = terminate_after_step
 
@@ -138,9 +131,12 @@ class MockDictEnv(Module):
 
         reward = randn(self.num_envs) if self.vectorized else randn(())
 
-        terminated = torch.full((self.num_envs,), False) if self.vectorized else torch.tensor(False)
+        shape = (self.num_envs,) if self.vectorized else ()
+        terminated = torch.full(shape, False, dtype = torch.bool)
 
         if exists(self.terminate_after_step) and self._step >= self.terminate_after_step:
             terminated = ~terminated
 
-        return obs, reward, terminated
+        truncated = torch.full(shape, False, dtype = torch.bool)
+
+        return obs, reward, terminated, truncated, dict()
