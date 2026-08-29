@@ -8322,7 +8322,7 @@ class DynamicsWorldModel(Module):
             )
 
             if is_var_len:
-                action_loss_mask = loss_mask_without_last if pred_len == (time - 1) else loss_mask
+                action_loss_mask = loss_mask_without_last if num_targets == (time - 1) else loss_mask
 
             if exists(discrete_log_probs):
                 discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)

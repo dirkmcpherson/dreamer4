@@ -1795,7 +1795,8 @@ def test_aug_conditioning():
     assert loss.numel() == 1
     assert loss >= 0.
 
-def test_dynamics_aug_conditioning():
+@param('shift_action_tokens', (False, True))
+def test_dynamics_aug_conditioning(shift_action_tokens):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
     tokenizer = VideoTokenizer(
@@ -1826,13 +1827,14 @@ def test_dynamics_aug_conditioning():
     video = torch.randn(2, 3, 5, 32, 32)
     discrete_actions = torch.randint(0, 4, (2, 4, 1))
     aug_id = torch.randint(0, 3, (2,))
+    lens = torch.full((2,), 4, dtype = torch.long)
 
-    loss, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = aug_id, return_all_losses = True)
+    loss, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = aug_id, lens = lens, shift_action_tokens = shift_action_tokens, return_all_losses = True)
 
     assert loss.numel() == 1
     assert loss >= 0.
 
-    loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, return_all_losses = True)
+    loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, lens = lens, shift_action_tokens = shift_action_tokens, return_all_losses = True)
     assert loss_int.numel() == 1
 
 @param('loss_type, detach_target, sigreg_num_subspaces, predict_residual', [
