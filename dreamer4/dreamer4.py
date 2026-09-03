@@ -145,6 +145,8 @@ class Experience:
     proprio: MaybeTensor = None
     critic_state: MaybeTensor = None
     agent_embed: MaybeTensor = None
+    actor_embed: MaybeTensor = None
+    critic_embed: MaybeTensor = None
     rewards: Tensor | None = None
     terminals: Tensor | None = None
     actions: Actions | None = None
@@ -934,6 +936,11 @@ class LatentAutoregressiveLoss(Module):
         else:
             sigreg_input = cat((x[:, :-1], target_output), dim = 0)
             sigreg_mask = cat((mask, mask), dim = 0) if exists(mask) else None
+
+        # broadcast mask to token dims so it aligns with the collapsed sigreg inputs
+
+        sigreg_mask = maybe(pad_right_ndim_to)(sigreg_mask, sigreg_input.ndim - 1)
+        sigreg_mask = sigreg_mask.expand(sigreg_input.shape[:-1]) if exists(sigreg_mask) else None
 
         # sub-jepa - Kai Zhao et al https://arxiv.org/abs/2605.09241v1
 
@@ -6183,6 +6190,8 @@ class DynamicsWorldModel(Module):
 
         acc_latents = None
         acc_agent_embed = None
+        acc_actor_embed = None
+        acc_critic_embed = None
         acc_policy_embed = None
 
         is_terminated = full((batch,), False, device = device)
@@ -6351,6 +6360,8 @@ class DynamicsWorldModel(Module):
             rewards = safe_cat((rewards, reward), dim = 1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+            acc_actor_embed = safe_cat((acc_actor_embed, one_actor_agent_embed), dim = 1)
+            acc_critic_embed = safe_cat((acc_critic_embed, one_critic_agent_embed), dim = 1)
 
             obs = next_obs
 
@@ -6423,7 +6434,9 @@ class DynamicsWorldModel(Module):
                 # evaluate the bootstrap state
 
                 one_agent_embed = embeds.agent[..., -1:, agent_index, :]
-                value_embed = one_agent_embed
+                one_actor_agent_embed = default(embeds.actor, embeds.agent)[..., -1:, agent_index, :]
+                one_critic_agent_embed = default(embeds.critic, embeds.agent)[..., -1:, agent_index, :]
+                value_embed = one_critic_agent_embed
 
                 if exists(self.critic_state_embedder) and exists(state_frame):
                     critic_embed = self.critic_state_embedder(state_frame.to(device))
@@ -6447,9 +6460,11 @@ class DynamicsWorldModel(Module):
 
                 if exists(acc_agent_embed):
                     acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                    acc_actor_embed = safe_cat((acc_actor_embed, one_actor_agent_embed), dim = 1)
+                    acc_critic_embed = safe_cat((acc_critic_embed, one_critic_agent_embed), dim = 1)
 
                 if exists(acc_policy_embed):
-                    policy_embed = self.policy_head(one_agent_embed)
+                    policy_embed = self.policy_head(one_actor_agent_embed)
                     acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
@@ -6481,6 +6496,8 @@ class DynamicsWorldModel(Module):
             values = values,
             old_action_unembeds = old_action_unembeds,
             agent_embed = acc_agent_embed if store_agent_embed else None,
+            actor_embed = acc_actor_embed if store_agent_embed else None,
+            critic_embed = acc_critic_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             is_truncated = is_truncated,
@@ -6529,6 +6546,8 @@ class DynamicsWorldModel(Module):
         old_values = experience.values
         rewards = experience.rewards
         agent_embeds = experience.agent_embed
+        actor_embeds = experience.actor_embed
+        critic_embeds = experience.critic_embed
         old_action_unembeds = experience.old_action_unembeds
 
         step_size = experience.step_size
@@ -6668,17 +6687,26 @@ class DynamicsWorldModel(Module):
             if is_tensor(agent_index):
                 batch_indices = torch.arange(agent_index.shape[0], device = agent_index.device)
                 agent_embeds = embeds.agent[batch_indices, :, agent_index]
+                actor_embeds = embeds.actor[batch_indices, :, agent_index] if exists(embeds.actor) else agent_embeds
+                critic_embeds = embeds.critic[batch_indices, :, agent_index] if exists(embeds.critic) else agent_embeds
             else:
                 agent_embeds = embeds.agent[..., agent_index, :]
+                actor_embeds = embeds.actor[..., agent_index, :] if exists(embeds.actor) else agent_embeds
+                critic_embeds = embeds.critic[..., agent_index, :] if exists(embeds.critic) else agent_embeds
+
+        actor_embeds = default(actor_embeds, agent_embeds)
+        critic_embeds = default(critic_embeds, agent_embeds)
 
         # maybe detach agent embed
 
         if only_learn_policy_value_heads:
             agent_embeds = agent_embeds.detach()
+            actor_embeds = actor_embeds.detach()
+            critic_embeds = critic_embeds.detach()
 
         # ppo
 
-        policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
+        policy_agent_embeds = frac_gradient(actor_embeds, self.agent_policy_gradient_frac)
         policy_embed = self.policy_head(policy_agent_embeds)
 
         # align actions with policy embed if latents had a bootstrap state appended
@@ -6857,7 +6885,7 @@ class DynamicsWorldModel(Module):
 
         # value loss
 
-        value_agent_embeds = frac_gradient(agent_embeds, self.agent_value_gradient_frac)
+        value_agent_embeds = frac_gradient(critic_embeds, self.agent_value_gradient_frac)
 
         # maybe critic asymmetric state
 
@@ -7091,6 +7119,8 @@ class DynamicsWorldModel(Module):
         # agent / policy embeds
 
         acc_agent_embed = None
+        acc_actor_embed = None
+        acc_critic_embed = None
         acc_policy_embed = None
 
         # rewards
@@ -7255,6 +7285,8 @@ class DynamicsWorldModel(Module):
 
             if needs_agent_embed:
                 one_agent_embed = embeds.agent[:, -1:, agent_index]
+                one_actor_agent_embed = default(embeds.actor, embeds.agent)[:, -1:, agent_index]
+                one_critic_agent_embed = default(embeds.critic, embeds.agent)[:, -1:, agent_index]
 
             if return_rewards_per_frame:
                 pooled_latents = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
@@ -7282,13 +7314,15 @@ class DynamicsWorldModel(Module):
 
             if store_agent_embed:
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                acc_actor_embed = safe_cat((acc_actor_embed, one_actor_agent_embed), dim = 1)
+                acc_critic_embed = safe_cat((acc_critic_embed, one_critic_agent_embed), dim = 1)
 
             # decode the agent actions if needed
 
             if return_agent_actions:
                 assert self.action_embedder.has_actions
 
-                policy_embed = self.policy_head(one_agent_embed)
+                policy_embed = self.policy_head(one_actor_agent_embed)
 
                 # maybe store old actions
 
@@ -7319,7 +7353,7 @@ class DynamicsWorldModel(Module):
                     decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
                     decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
 
-                    value_bins = self.value_head(one_agent_embed)
+                    value_bins = self.value_head(one_critic_agent_embed)
                     values = self.value_encoder.bins_to_scalar_value(value_bins)
 
                     decoded_values = safe_cat((decoded_values, values), dim = 1)
@@ -7413,6 +7447,8 @@ class DynamicsWorldModel(Module):
             video = video,
             proprio = proprio if has_proprio else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
+            actor_embed = acc_actor_embed if store_agent_embed else None,
+            critic_embed = acc_critic_embed if store_agent_embed else None,
             old_action_unembeds = old_action_unembeds,
             step_size = step_size,
             agent_index = agent_index,
