@@ -58,6 +58,11 @@ class ShortcutDynamics(nn.Module):
         ctx_noise: float | None = None,   # noise fraction mixed into context latents at inference (default 1 / k_max, the finest trained level)
         softcap: float | None = 50.0,
         x_skip: bool = False,             # parameterize x_hat = sigma * z_noised + net(...) (EDM-style skip)
+        ramp_weight: bool = True,         # paper: w(sigma) = 0.9 sigma + 0.1; False weights all signal levels equally
+        clean_context_prob: float = 0.0,  # fraction of sequences whose first frames are near-clean context (as at inference)
+                                          # and excluded from the loss; 0 is the paper's independent per-frame noise
+        regress_only: bool = False,       # diagnostic: one target frame per sequence, predicted in one step from pure
+                                          # noise given clean history, i.e. plain next-frame regression
     ):
         super().__init__()
         assert num_latents % pack == 0
@@ -71,6 +76,7 @@ class ShortcutDynamics(nn.Module):
         self.bootstrap_fraction = bootstrap_fraction
         self.ctx_noise = (1.0 / k_max) if ctx_noise is None else ctx_noise
         self.x_skip = x_skip
+        self.ramp_weight, self.clean_context_prob, self.regress_only = ramp_weight, clean_context_prob, regress_only
 
         self.in_proj = nn.Linear(self.d_spatial, dim)
         self.spatial_pos = nn.Parameter(torch.randn(self.n_spatial, dim) * 0.02)
@@ -140,6 +146,21 @@ class ShortcutDynamics(nn.Module):
         n_grid = 2 ** e
         j = (torch.rand(b, t, device=device) * n_grid).floor().long().clamp(max=n_grid - 1)
         sigma = j.float() / n_grid.float()
+
+        # optionally make the first frames of a sequence near-clean context, the situation met at inference
+        in_loss = torch.ones(b, t, dtype=torch.bool, device=device)
+        if self.regress_only or self.clean_context_prob > 0:
+            p_ctx = 1.0 if self.regress_only else self.clean_context_prob
+            split = torch.randint(1, t, (b, 1), device=device)
+            frame = torch.arange(t, device=device)[None]
+            is_ctx = (torch.rand(b, 1, device=device) < p_ctx) & (frame < split)
+            e = torch.where(is_ctx, torch.full_like(e, e_max), e)
+            sigma = torch.where(is_ctx, torch.full_like(sigma, (k_max - 1) / k_max), sigma)
+            in_loss = ~is_ctx
+            if self.regress_only:
+                e = torch.where(is_ctx, e, torch.zeros_like(e))
+                sigma = torch.where(is_ctx, sigma, torch.zeros_like(sigma))
+                in_loss = frame == split
         signal_idx = (sigma * k_max).round().long()
 
         z0 = torch.randn_like(z1)
@@ -147,7 +168,7 @@ class ShortcutDynamics(nn.Module):
         zt = (1 - s4) * z0 + s4 * z1
         x_hat = self.predict(zt, signal_idx, e, prev_actions, valid)
 
-        is_flow = (e == e_max) | warmup
+        is_flow = (e == e_max) | warmup | self.regress_only
         flow_pt = (x_hat - z1).pow(2).mean(dim=(2, 3))
 
         boot_pt = torch.zeros_like(flow_pt)
@@ -168,15 +189,16 @@ class ShortcutDynamics(nn.Module):
 
         # both terms are in x-space units (the (1 - sigma)^2 factor), so they share one ramp
         # weight and one RMS normalizer, as in Eq. 6 of the paper
-        ramp = 0.9 * sigma + 0.1
+        ramp = 0.9 * sigma + 0.1 if self.ramp_weight else torch.ones_like(sigma)
         per_row = torch.where(is_flow, flow_pt, boot_pt) * ramp
-        loss = per_row.mean()
+        loss = (per_row * in_loss).sum() / in_loss.sum().clamp_min(1)
         if self.loss_norm is not None:
             loss = self.loss_norm(loss)
-        n_flow, n_boot = is_flow.sum().clamp_min(1), (~is_flow).sum().clamp_min(1)
+        is_flow, is_boot = is_flow & in_loss, ~is_flow & in_loss
+        n_flow, n_boot = is_flow.sum().clamp_min(1), is_boot.sum().clamp_min(1)
         if self.training:
             self.train_steps += 1
-        stats = {"flow_mse": (flow_pt * is_flow).sum() / n_flow, "boot_mse": (boot_pt * ~is_flow).sum() / n_boot,
+        stats = {"flow_mse": (flow_pt * is_flow).sum() / n_flow, "boot_mse": (boot_pt * is_boot).sum() / n_boot,
                  "frac_flow": is_flow.float().mean()}
         return loss, {k: v.detach() for k, v in stats.items()}
 

@@ -119,11 +119,12 @@ class CausalTokenizer(nn.Module):
         return self.is_latent if self.time_tokens == "latents" else None
 
     def _lpips_fn(self):
-        if self._lpips is None:
+        # kept in __dict__ rather than registered as a submodule: its frozen weights must not end up in
+        # checkpoints (load_state_dict would reject them) and tok.train() must not switch on its dropout
+        if self.__dict__.get("_lpips") is None:
             import lpips
-            self._lpips = lpips.LPIPS(net="alex", verbose=False).to(self.enc_pos.device).eval()
-            self._lpips.requires_grad_(False)
-        return self._lpips
+            self.__dict__["_lpips"] = lpips.LPIPS(net="alex", verbose=False).eval().requires_grad_(False)
+        return self.__dict__["_lpips"].to(self.enc_pos.device)
 
     # ------------------------------------------------------------------ encode / decode
     def encode(self, video: Tensor, mask_patches: bool = False) -> Tensor:
