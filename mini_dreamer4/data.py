@@ -113,5 +113,32 @@ def load_pusht_zarr(path: str | Path, action_range: tuple[float, float] = (0.0, 
     return episodes
 
 
+def load_pusht_npz(path: str | Path, background: str | None = None) -> list[dict]:
+    """Episodes rendered by ``tools/render_rlpd_demos.py``: ``img`` uint8, ``action`` already in [-1, 1],
+    ``state``, ``coverage``, ``episode_ends``."""
+    # Read each array ONCE: indexing an NpzFile decompresses the whole array on every access, and a slice of
+    # that result keeps the full array alive, so per-episode d["img"][a:b] holds one full copy per episode.
+    with np.load(path) as d:
+        img, action, state, coverage, ends = d["img"], d["action"].astype(np.float32), d["state"], d["coverage"], d["episode_ends"]
+    episodes, start = [], 0
+    for end in ends:
+        frames = img[start:end]
+        if background == "texture":
+            frames = replace_white_background(frames, static_texture(frames.shape[1]))
+        # "coverage" (not "rewards") so that batches mix cleanly with the zarr episodes, which carry no reward
+        episodes.append({"video": frames, "actions": action[start:end], "states": state[start:end], "coverage": coverage[start:end]})
+        start = int(end)
+    return episodes
+
+
+def load_pusht(paths: str | Path, background: str | None = None) -> list[dict]:
+    """One or several (comma-separated) PushT datasets: ``.zarr`` (human demos) or ``.npz`` (rendered tapes)."""
+    episodes = []
+    for path in str(paths).split(","):
+        loader = load_pusht_npz if path.endswith(".npz") else load_pusht_zarr
+        episodes += loader(path, background=background)
+    return episodes
+
+
 def collate(batch: list[dict]) -> dict:
     return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}

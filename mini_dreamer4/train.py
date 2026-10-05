@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .data import EpisodeWindowDataset, collate, load_pusht_zarr
+from .data import EpisodeWindowDataset, collate, load_pusht
 from .dynamics import ShortcutDynamics
 from .envs import generate_episodes
 from .tokenizer import CausalTokenizer
@@ -31,9 +31,9 @@ def load_episodes(args) -> tuple[list[dict], list[dict]]:
         train = generate_episodes(args.synthetic_episodes, args.synthetic_length, image_size=args.image_size, seed=args.seed)
         val = generate_episodes(max(4, args.synthetic_episodes // 10), args.synthetic_length, image_size=args.image_size, seed=args.seed + 1)
         return train, val
-    episodes = load_pusht_zarr(args.data, background=args.background)
-    n_val = max(1, len(episodes) // 20)
-    return episodes[n_val:], episodes[:n_val]
+    episodes = load_pusht(args.data, background=args.background)
+    # every 20th episode is held out, so each dataset (and each start state) contributes to validation
+    return [e for i, e in enumerate(episodes) if i % 20], [e for i, e in enumerate(episodes) if not i % 20]
 
 
 def save(model: torch.nn.Module, cfg: dict, path: Path):
@@ -262,7 +262,7 @@ def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--data", default="synthetic")
+    common.add_argument("--data", default="synthetic", help="synthetic, or comma-separated PushT datasets (.zarr human demos, .npz rendered tapes)")
     common.add_argument("--shift", type=int, default=0, help="training augmentation: random clip-consistent translation of up to N pixels (PushT actions are shifted too)")
     common.add_argument("--background", default=None, choices=[None, "texture"], help="PushT only: replace the white background with a static texture")
     common.add_argument("--synthetic-episodes", type=int, default=400)
