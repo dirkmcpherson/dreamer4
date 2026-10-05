@@ -194,13 +194,23 @@ class ShortcutDynamics(nn.Module):
             stats["success_acc"] = ((rl > 0) == (success > 0.5)).float().mean()
         return bc, rew, stats
 
+    def _refine(self, logits: Tensor, idx: Tensor, radius: int = 2) -> Tensor:
+        """Sub-bin value: probability-weighted mean of the bin centres within ``radius`` of the chosen bin
+        (stays inside the chosen mode, removes most of the bin quantisation)."""
+        offs = torch.arange(-radius, radius + 1, device=logits.device)
+        near = (idx[..., None] + offs).clamp(0, self.action_bins - 1)
+        p = logits.softmax(-1).gather(-1, near)
+        return (self.from_bins(near) * p).sum(-1) / p.sum(-1).clamp_min(1e-9)
+
     @torch.no_grad()
-    def act(self, z: Tensor, actions: Tensor, sample: bool = False, temperature: float = 1.0) -> Tensor:
+    def act(self, z: Tensor, actions: Tensor, sample: bool = False, temperature: float = 1.0, refine: bool = False) -> Tensor:
         """Action for the LAST frame of z (B, T, N_l, d_b); actions (B, T, 2) with the last entry ignored."""
         h = self.agent_features(z, actions)[:, -1]
         pick = (lambda l: torch.distributions.Categorical(logits=l / temperature).sample()) if sample else (lambda l: l.argmax(-1))
-        ax = pick(self.pi_first(h))
-        ay = pick(self.pi_second(h + self.bin_embed(ax)))
+        lx = self.pi_first(h); ax = pick(lx)
+        ly = self.pi_second(h + self.bin_embed(ax)); ay = pick(ly)
+        if refine:
+            return torch.stack((self._refine(lx, ax), self._refine(ly, ay)), -1)
         return self.from_bins(torch.stack((ax, ay), -1))
 
     # ------------------------------------------------------------------ shortcut forcing loss

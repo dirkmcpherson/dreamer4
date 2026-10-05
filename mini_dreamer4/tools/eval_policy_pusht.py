@@ -29,7 +29,7 @@ def run(env, tok, agent, s0, args, dev, sample, rng_seed):
         a_in = torch.as_tensor(np.array(a_hist + [np.zeros(2, np.float32)]), device=dev).float()[None]
         with torch.no_grad():
             z = tok.encode(torch.stack(w).to(dev)[None])
-            a = agent.act(z, a_in, sample=sample, temperature=args.temperature)[0].cpu().numpy()
+            a = agent.act(z, a_in, sample=sample, temperature=args.temperature, refine=args.refine)[0].cpu().numpy()
         obs, r, term, trunc, info = env.step(to_env(a))
         actions.append(a.astype(np.float32)); frames.append(torch.as_tensor(obs["pixels"]).float().div(255).movedim(-1, -3))
         cov.append(float(info["coverage"]))
@@ -46,6 +46,7 @@ def main():
     p.add_argument("--window", type=int, default=10)
     p.add_argument("--sampled", type=int, default=5, help="additional episodes per start with sampled actions")
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--refine", action="store_true", help="sub-bin decoding: probability-weighted mean around the chosen bin")
     p.add_argument("--success-threshold", type=float, default=0.95)
     p.add_argument("--out", default=None)
     args = p.parse_args()
