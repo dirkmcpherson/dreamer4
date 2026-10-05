@@ -113,7 +113,7 @@ def load_pusht_zarr(path: str | Path, action_range: tuple[float, float] = (0.0, 
     return episodes
 
 
-def load_pusht_npz(path: str | Path, background: str | None = None) -> list[dict]:
+def load_pusht_npz(path: str | Path, background: str | None = None, success_threshold: float = 0.95) -> list[dict]:
     """Episodes rendered by ``tools/render_rlpd_demos.py``: ``img`` uint8, ``action`` already in [-1, 1],
     ``state``, ``coverage``, ``episode_ends``."""
     # Read each array ONCE: indexing an NpzFile decompresses the whole array on every access, and a slice of
@@ -128,7 +128,10 @@ def load_pusht_npz(path: str | Path, background: str | None = None) -> list[dict
         # "coverage" (not "rewards") so that batches mix cleanly with the zarr episodes, which carry no reward
         n = int(end) - start
         episodes.append({"video": frames, "actions": action[start:end], "states": state[start:end], "coverage": coverage[start:end],
-                         "action_mask": np.arange(n) < n - 1})         # no action is taken at an episode's last frame
+                         # behaviour-cloning mask: no action is taken at an episode's last frame, and episodes that do
+                         # not end in success (failed rollouts, tapes that fail on replay) are never imitated;
+                         # they still train the dynamics and the success head
+                         "action_mask": (np.arange(n) < n - 1) & bool(coverage[int(end) - 1] > success_threshold)})
         start = int(end)
     return episodes
 
