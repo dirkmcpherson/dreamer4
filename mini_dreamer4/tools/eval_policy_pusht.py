@@ -13,14 +13,13 @@ import numpy as np
 import torch
 
 from mini_dreamer4.train import load_tokenizer, load_dynamics
-from mini_dreamer4.tools.plan_pusht import make_env, to_env, to_norm
+from mini_dreamer4.tools.plan_pusht import make_env, set_state_exact, to_env
 
 
 def run(env, tok, agent, s0, args, dev, sample, rng_seed):
     u = env.unwrapped
     env.reset(seed=0)
-    u.agent.position = tuple(map(float, s0[:2])); u.block.angle = float(s0[4]); u.block.position = tuple(map(float, s0[2:4]))
-    u.agent.velocity = (0, 0); u.block.velocity = (0, 0); u.block.angular_velocity = 0
+    set_state_exact(env, s0)
     frames = [torch.as_tensor(u._render()).float().div(255).movedim(-1, -3)]
     actions, cov = [], [float(u._get_coverage())]
     torch.manual_seed(rng_seed)

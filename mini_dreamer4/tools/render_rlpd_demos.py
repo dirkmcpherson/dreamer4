@@ -11,17 +11,7 @@ episode), ``state`` (N, 5), ``coverage`` (N,) and ``episode_ends`` (E,), the lay
 import argparse, json, time
 import numpy as np
 
-from mini_dreamer4.tools.plan_pusht import make_env
-
-
-def set_state(u, s):
-    """Their convention: angle before position, which restores the recorded body origin exactly."""
-    u.agent.position = tuple(map(float, s[:2]))
-    u.block.angle = float(s[4])
-    u.block.position = tuple(map(float, s[2:4]))
-    u.agent.velocity = (0, 0)
-    u.block.velocity = (0, 0)
-    u.block.angular_velocity = 0
+from mini_dreamer4.tools.plan_pusht import make_env, set_state_exact
 
 
 def decode_state(obs):             # inverse of their encode_state: (x - 256) / 256, sin, cos
@@ -50,7 +40,7 @@ def main():
             idx = np.nonzero(d["episode"] == e)[0]
             seed = int(d["ic_seed"][idx[0]]) if "ic_seed" in d.files else None
             s0 = starts.get(seed, decode_state(d["obs"][idx[0]]))
-            set_state(u, s0)
+            set_state_exact(env, s0)
             frames, ep_states, ep_cov = [u._render()], [np.array([*u.agent.position, *u.block.position, u.block.angle])], [u._get_coverage()]
             for i in idx:
                 obs, r, term, trunc, info = env.step(((d["action"][i] + 1) / 2 * 512).astype(np.float32))

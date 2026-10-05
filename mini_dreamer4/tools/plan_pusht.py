@@ -37,6 +37,21 @@ def sim_state(env) -> np.ndarray:
     return np.array([*u.agent.position, *u.block.position, u.block.angle], dtype=np.float64)
 
 
+def set_state_exact(env, s) -> None:
+    """Put the simulator in recorded state ``s`` = (agent xy, block xy, block angle), gp_wmfi_gym convention:
+    angle before position restores the recorded body origin exactly. The shapes are re-indexed because the
+    renderer draws from cached shape geometry; without it the next frame still shows the previous pose."""
+    u = env.unwrapped
+    u.agent.position = tuple(map(float, s[:2]))
+    u.block.angle = float(s[4])
+    u.block.position = tuple(map(float, s[2:4]))
+    u.agent.velocity = (0, 0)
+    u.block.velocity = (0, 0)
+    u.block.angular_velocity = 0
+    u.space.reindex_shapes_for_body(u.agent)
+    u.space.reindex_shapes_for_body(u.block)
+
+
 def corrected_state(env) -> np.ndarray:
     """State for ``reset(options={"reset_to_state": s})`` that reproduces the live agent/block pose exactly
     (gym-pusht applies the pose about the block's centre of mass, so the raw pose lands elsewhere).
@@ -189,10 +204,8 @@ def run_episode(args, ep, tok, dyn, reward, dev, out):
     if args.starts:                                                # fixed start states from a gp_wmfi_gym manifest
         ics = json.load(open(args.starts))["initial_conditions"]
         s0 = np.array(ics[ep % len(ics)]["raw_state_after_reset"])
-        u = env.unwrapped                                          # their convention: angle before position
-        u.agent.position = tuple(map(float, s0[:2])); u.block.angle = float(s0[4]); u.block.position = tuple(map(float, s0[2:4]))
-        u.agent.velocity = (0, 0); u.block.velocity = (0, 0); u.block.angular_velocity = 0
-        obs = u.get_obs()
+        set_state_exact(env, s0)
+        obs = env.unwrapped.get_obs()
     frames = [torch.as_tensor(obs["pixels"]).float().div(255).movedim(-1, -3)]
     acts = []                                                      # normalized action taken at each frame
     planner = ModelPlanner(tok, dyn, reward, horizon=args.horizon, pop=args.pop, elites=args.elites, iters=args.iters, step_std=args.step_std, dev=dev) if args.mode == "model" else \
