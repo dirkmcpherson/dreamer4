@@ -256,11 +256,18 @@ def train_agent(args):
     val_a, val_m, val_s = val["actions"].to(device), val["action_mask"].to(device) > 0.5, (val["coverage"].to(device) > args.success_threshold).float()
     val_video = val["video"].to(device)
 
-    init = torch.load(args.dynamics, map_location=device)
-    cfg = {**init["config"], "agent": True, "action_bins": args.action_bins, "bootstrap_warmup": 0}
-    dyn = ShortcutDynamics(**cfg).to(device)
-    missing = dyn.load_state_dict(init["state_dict"], strict=False)
-    print(f"initialised from {args.dynamics}; new parameter groups: {sorted({k.split('.')[0] for k in missing.missing_keys})}", flush=True)
+    if args.dynamics == "none":                       # control: same network and heads, no dynamics pretraining
+        cfg = dict(num_latents=tok.num_latents, latent_dim=tok.latent_dim, pack=args.pack, dim=args.dim, depth=args.depth, heads=args.heads,
+                   dim_head=args.dim_head, time_every=args.time_every, num_registers=args.registers, k_max=args.k_max, action_dim=2,
+                   bootstrap_warmup=0, ramp_weight=not args.no_ramp, clean_context_prob=args.clean_context_prob, agent=True, action_bins=args.action_bins)
+        dyn = ShortcutDynamics(**cfg).to(device)
+        print("control run: randomly initialised transformer", flush=True)
+    else:
+        init = torch.load(args.dynamics, map_location=device)
+        cfg = {**init["config"], "agent": True, "action_bins": args.action_bins, "bootstrap_warmup": 0}
+        dyn = ShortcutDynamics(**cfg).to(device)
+        missing = dyn.load_state_dict(init["state_dict"], strict=False)
+        print(f"initialised from {args.dynamics}; new parameter groups: {sorted({k.split('.')[0] for k in missing.missing_keys})}", flush=True)
     log = Logger(args, cfg)
     opt = torch.optim.AdamW(dyn.parameters(), lr=args.lr, weight_decay=0.01)
     lr_at = lambda s: min(1.0, (s + 1) / 500) * (0.5 * (1 + math.cos(math.pi * min(1.0, s / args.steps))) * 0.98 + 0.02)
@@ -272,6 +279,8 @@ def train_agent(args):
         with torch.no_grad():
             z = tok.encode(batch["video"].to(device))
         dyn_loss, stats = dyn(z, actions)
+        if args.dyn_weight == 0:
+            dyn_loss = dyn_loss.detach() * 0           # control: no dynamics gradient at all
         bc, rew, astats = dyn.agent_loss(z, actions, batch["action_mask"].to(device) > 0.5,
                                          (batch["coverage"].to(device) > args.success_threshold).float())
         loss = dyn_loss + args.bc_weight * dyn.bc_norm(bc) + args.reward_weight * dyn.rew_norm(rew)
@@ -372,7 +381,10 @@ def main():
 
     a = sub.add_parser("agent", parents=[common])
     a.add_argument("--tokenizer", required=True)
-    a.add_argument("--dynamics", required=True, help="trained dynamics checkpoint to start from")
+    a.add_argument("--dynamics", required=True, help="trained dynamics checkpoint to start from, or 'none' for a randomly initialised control")
+    a.add_argument("--dyn-weight", type=float, default=1.0, help="0 disables the dynamics loss (control)")
+    a.add_argument("--pack", type=int, default=2); a.add_argument("--registers", type=int, default=4); a.add_argument("--k-max", type=int, default=64)
+    a.add_argument("--clean-context-prob", type=float, default=0.0); a.add_argument("--no-ramp", action="store_true")
     a.add_argument("--action-bins", type=int, default=128)
     a.add_argument("--bc-weight", type=float, default=1.0)
     a.add_argument("--reward-weight", type=float, default=0.3)
