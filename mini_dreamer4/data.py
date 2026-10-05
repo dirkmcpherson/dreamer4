@@ -57,7 +57,7 @@ class EpisodeWindowDataset(Dataset):
                 actions[:, 0] += 2 * dx / w
                 actions[:, 1] += 2 * dy / h
         out = {"video": video, "actions": actions}
-        for k in ("states", "rewards"):
+        for k in ("states", "rewards", "coverage", "action_mask"):
             if k in ep:
                 out[k] = torch.as_tensor(ep[k][sl]).float()
         return out
@@ -126,7 +126,9 @@ def load_pusht_npz(path: str | Path, background: str | None = None) -> list[dict
         if background == "texture":
             frames = replace_white_background(frames, static_texture(frames.shape[1]))
         # "coverage" (not "rewards") so that batches mix cleanly with the zarr episodes, which carry no reward
-        episodes.append({"video": frames, "actions": action[start:end], "states": state[start:end], "coverage": coverage[start:end]})
+        n = int(end) - start
+        episodes.append({"video": frames, "actions": action[start:end], "states": state[start:end], "coverage": coverage[start:end],
+                         "action_mask": np.arange(n) < n - 1})         # no action is taken at an episode's last frame
         start = int(end)
     return episodes
 

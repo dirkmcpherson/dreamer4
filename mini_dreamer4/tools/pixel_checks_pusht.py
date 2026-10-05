@@ -11,15 +11,20 @@ environment loads the textured variant of the data (the tokenizer must have been
 """
 import os, sys
 import torch, torch.nn.functional as F
-from mini_dreamer4.data import load_pusht_zarr
+from mini_dreamer4.data import load_pusht
 from mini_dreamer4.train import load_tokenizer, load_dynamics
 
-dev, CTX, WIN, H, K = "cuda", 4, 16, 44, 4
+dev, CTX, WIN, K = "cuda", 4, 16, 4
+H = int(os.environ.get("H", 44))                            # rollout length; short episodes (RLPD tapes) need H=12
 BLOCK = torch.tensor([[143, 163, 184], [119, 136, 153]], device=dev).float() / 255
 AGENT = torch.tensor([[78, 126, 255], [65, 105, 225]], device=dev).float() / 255
 tok = load_tokenizer(sys.argv[2], dev)
-episodes = load_pusht_zarr(sys.argv[1], background=os.environ.get("BACKGROUND"))
-val_eps = episodes[:max(1, len(episodes) // 20)]          # same held-out split as mini_dreamer4.train
+episodes = load_pusht(sys.argv[1], background=os.environ.get("BACKGROUND"))
+if os.environ.get("SPLIT", "every20") == "first5pct":       # the split used by the runs before 2026-10-05
+    val_eps = episodes[:max(1, len(episodes) // 20)]
+else:                                                       # same held-out split as mini_dreamer4.train
+    val_eps = [e for i, e in enumerate(episodes) if not i % 20]
+val_eps = [e for e in val_eps if len(e["video"]) >= CTX + H]
 
 v, a = [], []
 for e in val_eps:
@@ -63,7 +68,7 @@ def rollout(dyn, z_ctx, act):
 with torch.no_grad():
     z_true = chunks(tok.encode, video)
     recon = chunks(lambda z: tok.decode(z).clamp(0, 1), z_true.cpu()).cpu()
-HS = (1, 2, 4, 8, 12, 16, 24, 32, 44)
+HS = [h for h in (1, 2, 4, 8, 12, 16, 24, 32, 44) if h <= H]
 truth_at = lambda h: video[:, CTX + h - 1].to(dev)
 last = video[:, CTX - 1].to(dev)
 d_true = (truth_at(1)[:, :1] * 0)
@@ -96,7 +101,7 @@ for path in sys.argv[3:]:
     name = path.split("/")[-1]
     table("MODEL %s, true actions" % name, lambda h: pix[:, CTX + h - 1].to(dev))
     table("MODEL %s, another clip's actions" % name, lambda h: pix_w[:, CTX + h - 1].to(dev))
-    for h in (12, 44):
+    for h in [h for h in (12, 44) if h <= H]:
         ct, okt = centroid(mask(truth_at(h), BLOCK, 0.2)); cm, okm = centroid(mask(pix[:, CTX + h - 1].to(dev), BLOCK, 0.2))
         ok = okt & okm & ok_last
         dr, dm = (ct - c_last)[ok], (cm - c_last)[ok]

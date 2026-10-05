@@ -63,6 +63,8 @@ class ShortcutDynamics(nn.Module):
                                           # and excluded from the loss; 0 is the paper's independent per-frame noise
         regress_only: bool = False,       # diagnostic: one target frame per sequence, predicted in one step from pure
                                           # noise given clean history, i.e. plain next-frame regression
+        agent: bool = False,              # add an agent token per time step with policy and reward heads (paper, Sec. 3.3)
+        action_bins: int = 128,           # policy head: categorical over bins per action dimension
     ):
         super().__init__()
         assert num_latents % pack == 0
@@ -96,6 +98,24 @@ class ShortcutDynamics(nn.Module):
         self.loss_norm = LossNormalizer() if loss_norm else None
         self.register_buffer("train_steps", torch.tensor(0), persistent=True)
 
+        # ---- agent: one extra token per time step that reads everything in its step (and its own past) while no
+        # other token attends to it, so the world model's predictions are unchanged by its presence
+        self.agent, self.action_bins = agent, action_bins
+        if agent:
+            assert action_dim == 2, "the policy head is written for 2-D continuous actions"
+            head = lambda out: nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, out))
+            self.agent_token = nn.Parameter(torch.randn(dim) * 0.02)
+            self.agent_norm = RMSNorm(dim)
+            self.pi_first = head(action_bins)                 # p(a_x | h)
+            self.bin_embed = nn.Embedding(action_bins, dim)
+            self.pi_second = head(action_bins)                # p(a_y | h, a_x): the two dimensions are not independent
+            self.reward_head = head(1)                        # logit of "this frame is a success"
+            s = 2 + num_registers + self.n_spatial + 1
+            allowed = torch.ones(s, s, dtype=torch.bool)
+            allowed[:-1, -1] = False
+            self.register_buffer("agent_mask", allowed, persistent=False)
+            self.bc_norm, self.rew_norm = LossNormalizer(), LossNormalizer()
+
     # ------------------------------------------------------------------ network
     def _action_tokens(self, actions: Tensor | None, valid: Tensor, b: int, t: int) -> Tensor:
         tok = self.action_base.expand(b, t, -1)
@@ -109,8 +129,9 @@ class ShortcutDynamics(nn.Module):
         return tok + emb * valid.to(emb.dtype)[..., None]
 
     def predict(self, z_noised: Tensor, signal_idx: Tensor, step_idx: Tensor,
-                prev_actions: Tensor | None = None, action_valid: Tensor | None = None) -> Tensor:
-        """x-prediction of the clean latents. z_noised (B, T, N_l, d_b); signal_idx, step_idx (B, T) long."""
+                prev_actions: Tensor | None = None, action_valid: Tensor | None = None, return_agent: bool = False):
+        """x-prediction of the clean latents. z_noised (B, T, N_l, d_b); signal_idx, step_idx (B, T) long.
+        With ``return_agent`` also returns the agent token features (B, T, dim)."""
         b, t = z_noised.shape[:2]
         if action_valid is None:
             action_valid = torch.zeros(b, t, dtype=torch.bool, device=z_noised.device)
@@ -118,13 +139,69 @@ class ShortcutDynamics(nn.Module):
         flow = torch.cat((self.signal_embed(signal_idx), self.step_embed(step_idx)), dim=-1)[:, :, None]
         act = self._action_tokens(prev_actions, action_valid, b, t)[:, :, None]
         reg = self.registers.expand(b, t, -1, -1)
-        h = self.transformer(torch.cat((flow, act, reg, sp), dim=2))
-        out = self.out_proj(self.out_norm(h[:, :, 2 + self.num_registers:]))
+        tokens, mask = [flow, act, reg, sp], None
+        if self.agent:
+            tokens.append(self.agent_token.expand(b, t, 1, -1))
+            mask = self.agent_mask
+        h = self.transformer(torch.cat(tokens, dim=2), space_mask=mask)
+        first = 2 + self.num_registers
+        out = self.out_proj(self.out_norm(h[:, :, first:first + self.n_spatial]))
         out = out.reshape(b, t, self.num_latents, self.latent_dim)
         if self.x_skip:
             sigma = signal_idx.float() / self.k_max
             out = out + sigma[..., None, None] * z_noised
+        if return_agent:
+            return out, self.agent_norm(h[:, :, -1])
         return out
+
+    # ------------------------------------------------------------------ agent
+    def to_bins(self, a: Tensor) -> Tensor:
+        return ((a.clamp(-1, 1) + 1) / 2 * self.action_bins).long().clamp(max=self.action_bins - 1)
+
+    def from_bins(self, idx: Tensor) -> Tensor:
+        return (idx.float() + 0.5) / self.action_bins * 2 - 1
+
+    def agent_features(self, z: Tensor, actions: Tensor) -> Tensor:
+        """Agent token features (B, T, dim) from CLEAN latents, as at inference. The feature at frame t sees
+        frames <= t and the actions that produced them, never the action taken at frame t."""
+        b, t = z.shape[:2]
+        prev, valid = shift_actions(actions, b, t, z.device)
+        sig = torch.full((b, t), self.k_max - 1, dtype=torch.long, device=z.device)
+        step = torch.full((b, t), self.max_exp, dtype=torch.long, device=z.device)
+        return self.predict(z, sig, step, prev, valid, return_agent=True)[1]
+
+    def agent_loss(self, z: Tensor, actions: Tensor, action_mask: Tensor, success: Tensor | None = None) -> tuple[Tensor, Tensor, dict]:
+        """Behaviour cloning (and success prediction) from the agent token. actions (B, T, 2) taken at frame t;
+        action_mask (B, T) False where no action was taken (last frame of an episode); success (B, T) in {0, 1}."""
+        h = self.agent_features(z, actions)
+        target = self.to_bins(actions)
+        logit_x = self.pi_first(h)
+        logit_y = self.pi_second(h + self.bin_embed(target[..., 0]))
+        ce = F.cross_entropy(logit_x.flatten(0, 1), target[..., 0].flatten(), reduction="none") \
+            + F.cross_entropy(logit_y.flatten(0, 1), target[..., 1].flatten(), reduction="none")
+        m = action_mask.flatten().float()
+        bc = (ce * m).sum() / m.sum().clamp_min(1)
+        with torch.no_grad():                                  # greedy action as at inference: argmax x, then y given that x
+            ax = logit_x.argmax(-1)
+            ay = self.pi_second(h + self.bin_embed(ax)).argmax(-1)
+            err = (self.from_bins(torch.stack((ax, ay), -1)) - actions).abs().sum(-1).flatten()
+            stats = {"bc_ce": bc.detach(), "bc_l1": (err * m).sum() / m.sum().clamp_min(1),
+                     "bc_within_2_bins": ((((torch.stack((ax, ay), -1) - target).abs() <= 2).all(-1).flatten().float()) * m).sum() / m.sum().clamp_min(1)}
+        rew = torch.zeros((), device=z.device)
+        if success is not None:
+            rl = self.reward_head(h).squeeze(-1)
+            rew = F.binary_cross_entropy_with_logits(rl, success.float())
+            stats["success_acc"] = ((rl > 0) == (success > 0.5)).float().mean()
+        return bc, rew, stats
+
+    @torch.no_grad()
+    def act(self, z: Tensor, actions: Tensor, sample: bool = False, temperature: float = 1.0) -> Tensor:
+        """Action for the LAST frame of z (B, T, N_l, d_b); actions (B, T, 2) with the last entry ignored."""
+        h = self.agent_features(z, actions)[:, -1]
+        pick = (lambda l: torch.distributions.Categorical(logits=l / temperature).sample()) if sample else (lambda l: l.argmax(-1))
+        ax = pick(self.pi_first(h))
+        ay = pick(self.pi_second(h + self.bin_embed(ax)))
+        return self.from_bins(torch.stack((ax, ay), -1))
 
     # ------------------------------------------------------------------ shortcut forcing loss
     def forward(self, z1: Tensor, actions: Tensor | None = None) -> tuple[Tensor, dict]:

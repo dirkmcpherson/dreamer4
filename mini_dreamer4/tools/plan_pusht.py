@@ -186,10 +186,17 @@ class OraclePlanner:
 def run_episode(args, ep, tok, dyn, reward, dev, out):
     env = make_env()
     obs, info = env.reset(seed=args.seed + ep)
+    if args.starts:                                                # fixed start states from a gp_wmfi_gym manifest
+        ics = json.load(open(args.starts))["initial_conditions"]
+        s0 = np.array(ics[ep % len(ics)]["raw_state_after_reset"])
+        u = env.unwrapped                                          # their convention: angle before position
+        u.agent.position = tuple(map(float, s0[:2])); u.block.angle = float(s0[4]); u.block.position = tuple(map(float, s0[2:4]))
+        u.agent.velocity = (0, 0); u.block.velocity = (0, 0); u.block.angular_velocity = 0
+        obs = u.get_obs()
     frames = [torch.as_tensor(obs["pixels"]).float().div(255).movedim(-1, -3)]
     acts = []                                                      # normalized action taken at each frame
-    planner = ModelPlanner(tok, dyn, reward, horizon=args.horizon, pop=args.pop, elites=args.elites, iters=args.iters, dev=dev) if args.mode == "model" else \
-        OraclePlanner(horizon=args.horizon, pop=args.pop // 2, elites=args.elites // 2, iters=2) if args.mode == "oracle" else None
+    planner = ModelPlanner(tok, dyn, reward, horizon=args.horizon, pop=args.pop, elites=args.elites, iters=args.iters, step_std=args.step_std, dev=dev) if args.mode == "model" else \
+        OraclePlanner(horizon=args.horizon, pop=args.pop // 2, elites=args.elites // 2, iters=2, step_std=args.step_std) if args.mode == "oracle" else None
     log = dict(coverage=[], open_loop=[], one_step=[])
     rw = np.random.default_rng(args.seed + ep)
     agent = to_norm(obs["agent_pos"])
@@ -197,7 +204,7 @@ def run_episode(args, ep, tok, dyn, reward, dev, out):
     t0 = time.time()
     for t in range(args.steps):
         if args.mode == "random":
-            wander = np.clip(wander + rw.normal(0, 0.06, 2), -1, 1)
+            wander = np.clip(wander + rw.normal(0, args.step_std, 2), -1, 1)
             a = wander
         elif args.mode == "oracle":
             a = planner.plan(corrected_state(env), agent)["actions"][0]
@@ -261,6 +268,8 @@ def main():
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--open-loop-every", type=int, default=20)
     p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--starts", default=None, help="gp_wmfi_gym manifest json: episodes cycle over its initial_conditions")
+    p.add_argument("--step-std", type=float, default=0.06, help="per-step std of sampled target moves in [-1, 1] units (0.06 ~ human demos, 0.3 ~ RLPD tapes)")
     p.add_argument("--out", default="runs/plan")
     args = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -271,6 +280,7 @@ def main():
     reward = PixelReward(env, dev)
     results = [run_episode(args, ep, tok, dyn, reward, dev, out) for ep in range(args.episodes)]
     summary = dict(mode=args.mode, episodes=len(results), success_rate=float(np.mean([r["success"] for r in results])),
+                   successes=[int(r["success"]) for r in results], steps=[r["steps"] for r in results],
                    mean_final_coverage=float(np.mean([r["final_coverage"] for r in results])),
                    mean_max_coverage=float(np.mean([r["max_coverage"] for r in results])))
     if args.mode == "model":

@@ -236,6 +236,68 @@ def train_dynamics(args):
     log.close()
 
 
+# ---------------------------------------------------------------------------------- agent
+def train_agent(args):
+    """Joint training of the dynamics model and an agent token with policy / success heads (behaviour cloning).
+
+    Starts from a trained dynamics checkpoint. Every step optimises the shortcut-forcing loss and, through a second
+    pass on clean latents, the behaviour-cloning and success-prediction losses; all three update the shared transformer.
+    """
+    device = torch.device(args.device)
+    tok = load_tokenizer(args.tokenizer, device)
+    train_eps, val_eps = load_episodes(args)
+    assert all("action_mask" in e for e in train_eps + val_eps), "agent training needs datasets with action masks (rendered tapes, .npz)"
+    ds = EpisodeWindowDataset(train_eps, args.seq_len, tok.image_size, samples_per_epoch=args.steps * args.batch_size, seed=args.seed,
+                              shift=args.shift, shift_actions=args.data != "synthetic")
+    dl = iter(DataLoader(ds, batch_size=args.batch_size, collate_fn=collate, num_workers=args.workers))
+    val = val_windows(val_eps, args.seq_len, tok.image_size, args.val_windows)
+    with torch.no_grad():
+        val_z = tok.encode(val["video"].to(device))
+    val_a, val_m, val_s = val["actions"].to(device), val["action_mask"].to(device) > 0.5, (val["coverage"].to(device) > args.success_threshold).float()
+    val_video = val["video"].to(device)
+
+    init = torch.load(args.dynamics, map_location=device)
+    cfg = {**init["config"], "agent": True, "action_bins": args.action_bins, "bootstrap_warmup": 0}
+    dyn = ShortcutDynamics(**cfg).to(device)
+    missing = dyn.load_state_dict(init["state_dict"], strict=False)
+    print(f"initialised from {args.dynamics}; new parameter groups: {sorted({k.split('.')[0] for k in missing.missing_keys})}", flush=True)
+    log = Logger(args, cfg)
+    opt = torch.optim.AdamW(dyn.parameters(), lr=args.lr, weight_decay=0.01)
+    lr_at = lambda s: min(1.0, (s + 1) / 500) * (0.5 * (1 + math.cos(math.pi * min(1.0, s / args.steps))) * 0.98 + 0.02)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+    out, ctx = Path(args.out), max(2, args.seq_len // 4)
+    for step in range(1, args.steps + 1):
+        batch = next(dl)
+        actions = batch["actions"].to(device)
+        with torch.no_grad():
+            z = tok.encode(batch["video"].to(device))
+        dyn_loss, stats = dyn(z, actions)
+        bc, rew, astats = dyn.agent_loss(z, actions, batch["action_mask"].to(device) > 0.5,
+                                         (batch["coverage"].to(device) > args.success_threshold).float())
+        loss = dyn_loss + args.bc_weight * dyn.bc_norm(bc) + args.reward_weight * dyn.rew_norm(rew)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(dyn.parameters(), 1.0)
+        opt.step()
+        sched.step()
+        if step % args.log_every == 0 or step == args.steps:
+            dyn.eval()
+            with torch.no_grad():
+                _, _, vstats = dyn.agent_loss(val_z, val_a, val_m, val_s)
+            dyn.train()
+            metrics, full = evaluate_dynamics(tok, dyn, val_video, val_z, val_a, ctx)
+            log.scalars(step, flow_mse=stats["flow_mse"].item(), train_bc_ce=astats["bc_ce"].item(),
+                        **{"val_" + k: v.item() for k, v in vstats.items()},
+                        val_bc_l1_px=vstats["bc_l1"].item() * tok.image_size / 2 * 512 / tok.image_size,
+                        **{k: metrics[k] for k in ("rollout_psnr_gain_over_floor", "rollout_shuffle_ratio", "rollout_latent_mse")})
+            if step % args.video_every == 0 or step == args.steps:
+                log.video(step, "rollout", val_video, full)
+        if step % args.save_every == 0 or step == args.steps:
+            save(dyn, cfg, out / "agent.pt")
+    print(f"saved {out / 'agent.pt'}")
+    log.close()
+
+
 # ---------------------------------------------------------------------------------- rollout
 def rollout(args):
     device = torch.device(args.device)
@@ -308,13 +370,21 @@ def main():
     d.add_argument("--no-ramp", action="store_true", help="weight all signal levels equally instead of 0.9 sigma + 0.1")
     d.add_argument("--cosine", action="store_true", help="cosine learning-rate decay with 1000 warmup steps (default: constant)")
 
+    a = sub.add_parser("agent", parents=[common])
+    a.add_argument("--tokenizer", required=True)
+    a.add_argument("--dynamics", required=True, help="trained dynamics checkpoint to start from")
+    a.add_argument("--action-bins", type=int, default=128)
+    a.add_argument("--bc-weight", type=float, default=1.0)
+    a.add_argument("--reward-weight", type=float, default=0.3)
+    a.add_argument("--success-threshold", type=float, default=0.95, help="a frame is a success when its coverage exceeds this")
+
     r = sub.add_parser("rollout", parents=[common])
     r.add_argument("--tokenizer", required=True)
     r.add_argument("--dynamics", required=True)
     r.add_argument("--num-steps", type=int, default=4)
 
     args = p.parse_args()
-    {"tokenizer": train_tokenizer, "dynamics": train_dynamics, "rollout": rollout}[args.cmd](args)
+    {"tokenizer": train_tokenizer, "dynamics": train_dynamics, "agent": train_agent, "rollout": rollout}[args.cmd](args)
 
 
 if __name__ == "__main__":
