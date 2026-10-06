@@ -14,6 +14,7 @@ W = 10
 
 
 def episode(env, tok, agent, s0, steps, dev):
+    env.reset(seed=0)                 # fresh physics state every episode, as in eval_policy_pusht (contacts persist otherwise)
     set_state_exact(env, s0); u = env.unwrapped
     frames, acts, cov = [u._render()], [], [float(u._get_coverage())]
     for t in range(steps):
