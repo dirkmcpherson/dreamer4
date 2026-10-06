@@ -52,7 +52,9 @@ def load_tokenizer(path: str, device) -> CausalTokenizer:
 def load_dynamics(path: str, device) -> ShortcutDynamics:
     ckpt = torch.load(path, map_location=device)
     dyn = ShortcutDynamics(**ckpt["config"]).to(device)
-    dyn.load_state_dict(ckpt["state_dict"])
+    result = dyn.load_state_dict(ckpt["state_dict"], strict=False)
+    # heads added after a checkpoint was written (e.g. the value head) start fresh; anything else must match
+    assert not result.unexpected_keys and all(k.startswith("value_head.") for k in result.missing_keys), result
     return dyn.eval()
 
 

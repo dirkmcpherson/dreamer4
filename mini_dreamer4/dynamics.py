@@ -110,6 +110,7 @@ class ShortcutDynamics(nn.Module):
             self.bin_embed = nn.Embedding(action_bins, dim)
             self.pi_second = head(action_bins)                # p(a_y | h, a_x): the two dimensions are not independent
             self.reward_head = head(1)                        # logit of "this frame is a success"
+            self.value_head = head(1)                         # expected discounted success from this frame (imagination training)
             s = 2 + num_registers + self.n_spatial + 1
             allowed = torch.ones(s, s, dtype=torch.bool)
             allowed[:-1, -1] = False
@@ -193,6 +194,24 @@ class ShortcutDynamics(nn.Module):
             rew = F.binary_cross_entropy_with_logits(rl, success.float())
             stats["success_acc"] = ((rl > 0) == (success > 0.5)).float().mean()
         return bc, rew, stats
+
+    # ------------------------------------------------------------------ policy distribution utilities (imagination training)
+    def policy_heads(self):
+        return [self.pi_first, self.bin_embed, self.pi_second]
+
+    def policy_logits(self, h: Tensor, ax: Tensor) -> tuple[Tensor, Tensor]:
+        """Logits of p(a_x | h) and p(a_y | h, a_x) for given first-dimension bins ax."""
+        return self.pi_first(h), self.pi_second(h + self.bin_embed(ax))
+
+    def policy_log_prob(self, h: Tensor, bins: Tensor) -> Tensor:
+        """log pi(a | h) for actions given as bins (..., 2)."""
+        lx, ly = self.policy_logits(h, bins[..., 0])
+        return lx.log_softmax(-1).gather(-1, bins[..., :1]).squeeze(-1) + ly.log_softmax(-1).gather(-1, bins[..., 1:]).squeeze(-1)
+
+    def policy_entropy(self, h: Tensor, bins: Tensor) -> Tensor:
+        lx, ly = self.policy_logits(h, bins[..., 0])
+        ent = lambda l: -(l.log_softmax(-1) * l.softmax(-1)).sum(-1)
+        return ent(lx) + ent(ly)
 
     def _refine(self, logits: Tensor, idx: Tensor, radius: int = 2) -> Tensor:
         """Sub-bin value: probability-weighted mean of the bin centres within ``radius`` of the chosen bin
