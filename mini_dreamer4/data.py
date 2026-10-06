@@ -137,11 +137,18 @@ def load_pusht_npz(path: str | Path, background: str | None = None, success_thre
 
 
 def load_pusht(paths: str | Path, background: str | None = None) -> list[dict]:
-    """One or several (comma-separated) PushT datasets: ``.zarr`` (human demos) or ``.npz`` (rendered tapes)."""
+    """One or several (comma-separated) PushT datasets: ``.zarr`` (human demos) or ``.npz`` (rendered tapes).
+    A ``:nobc`` suffix on a path keeps that dataset out of behaviour cloning (it still trains the dynamics and
+    the success head), e.g. ``tapes.npz,onpolicy.npz:nobc``."""
     episodes = []
-    for path in str(paths).split(","):
+    for spec in str(paths).split(","):
+        path, *flags = spec.split(":")
         loader = load_pusht_npz if path.endswith(".npz") else load_pusht_zarr
-        episodes += loader(path, background=background)
+        eps = loader(path, background=background)
+        if "nobc" in flags:
+            for e in eps:
+                e["action_mask"] = np.zeros(len(e["video"]), dtype=bool)
+        episodes += eps
     return episodes
 
 
