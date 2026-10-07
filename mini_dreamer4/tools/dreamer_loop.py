@@ -91,6 +91,8 @@ def main():
     p.add_argument("--gamma", type=float, default=0.97); p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--alpha", type=float, default=0.5); p.add_argument("--kl", type=float, default=0.1); p.add_argument("--entropy", type=float, default=1e-3)
     p.add_argument("--actor-lr", type=float, default=1e-4)
+    p.add_argument("--frozen-actor-trunk", action="store_true",
+                   help="policy/value heads read features from a frozen copy of the initial trunk; the live world model only supplies imagined transitions and the success reward")
     p.add_argument("--eval-sampled", type=int, default=10)
     p.add_argument("--log-every", type=int, default=250)
     p.add_argument("--seed", type=int, default=0)
@@ -105,9 +107,19 @@ def main():
     prior = copy.deepcopy(agent).eval()
     for q in prior.parameters():
         q.requires_grad_(False)
-    actor_params = [q for m in list(agent.policy_heads()) + [agent.value_head] for q in m.parameters()]
-    actor_ids = {id(q) for q in actor_params}
-    model_params = [q for q in agent.parameters() if id(q) not in actor_ids]
+    # The actor is a copy whose trunk stays frozen (as in Dreamer 4's imagination phase): only its policy and
+    # value heads train. Without a cloning term, letting the policy read the live, continuously trained trunk
+    # destroyed the policy through feature drift alone (the heads themselves barely moved).
+    actor = copy.deepcopy(agent).eval() if args.frozen_actor_trunk else agent
+    head_params = lambda m: [q for mod in list(m.policy_heads()) + [m.value_head] for q in mod.parameters()]
+    if args.frozen_actor_trunk:
+        for q in actor.parameters():
+            q.requires_grad_(False)
+        for q in head_params(actor):
+            q.requires_grad_(True)
+    actor_params = head_params(actor)
+    head_ids = {id(q) for q in head_params(agent)}
+    model_params = [q for q in agent.parameters() if id(q) not in head_ids]
     opt_model = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=0.01)
     opt_actor = torch.optim.Adam(actor_params, lr=args.actor_lr)
     run = None
@@ -127,12 +139,12 @@ def main():
     log = lambda d, s: (print(f"[{time.time() - t0:.0f}s] " + " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in d.items()), flush=True),
                         run.log(d, step=s) if run is not None else None)
 
-    g, smp = evaluate(env, tok, agent, starts, dev, args.eval_sampled, args.episode_steps)
+    g, smp = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
     log(dict(round=0, real_greedy=g, real_sampled=smp), step_global)
     for rnd in range(1, args.rounds + 1):
         # ---- 1. collect with the current policy
-        agent.eval()
-        new = collect(env, tok, agent, starts, dev, args.collect_per_start, args.episode_steps, args.collect_temperature, args.seed * 10 + rnd)
+        actor.eval()
+        new = collect(env, tok, actor, starts, dev, args.collect_per_start, args.episode_steps, args.collect_temperature, args.seed * 10 + rnd)
         agent.train()
         replay += new
         succ = float(np.mean([e["coverage"][-1] > 0.95 for e in new]))
@@ -156,32 +168,34 @@ def main():
             opt_model.zero_grad(set_to_none=True); opt_actor.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model_params, 1.0); torch.nn.utils.clip_grad_norm_(actor_params, 1.0)
-            opt_model.step(); opt_actor.step()                      # the BC anchor also moves the policy heads
+            opt_model.step()
+            if args.bc_weight > 0:
+                opt_actor.step()                                    # the BC anchor also moves the policy heads (with weight 0 the heads' grads are zero and an Adam step would only replay momentum)
             imag = {}
             if step % args.imag_every == 0:
                 agent.eval()                                        # imagined rollouts from the real prefixes of this batch
                 L = int(np.random.randint(1, 5)); nb = min(args.imag_batch, z.shape[0])
-                h, bins, p_succ, h_last = imagine(tok, agent, z[:nb, :L], actions[:nb, :L - 1], args.horizon, 1.0)
+                h, bins, p_succ, h_last = imagine(tok, agent, z[:nb, :L], actions[:nb, :L - 1], args.horizon, 1.0, actor=actor)
                 agent.train()
                 success = (p_succ > 0.5).float()
                 alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)
                 reward, cont = p_succ * alive, (1 - success) * alive
                 with torch.no_grad():
-                    v_next = torch.cat((agent.value_head(h[:, 1:]).squeeze(-1), agent.value_head(h_last).squeeze(-1)[:, None]), 1)
+                    v_next = torch.cat((actor.value_head(h[:, 1:]).squeeze(-1), actor.value_head(h_last).squeeze(-1)[:, None]), 1)
                 R = lambda_returns(reward, cont, v_next, args.gamma, args.lam)
-                v = agent.value_head(h).squeeze(-1)
+                v = actor.value_head(h).squeeze(-1)
                 value_loss = ((v - R.detach()) ** 2 * alive).sum() / alive.sum()
                 adv = (R - v).detach()
-                logp = agent.policy_log_prob(h, bins)
+                logp = actor.policy_log_prob(h, bins)
                 pos, neg = ((adv > 0) & (alive > 0)).float(), ((adv < 0) & (alive > 0)).float()
                 pmpo = -(1 - args.alpha) * (logp * pos).sum() / pos.sum().clamp_min(1) + args.alpha * (logp * neg).sum() / neg.sum().clamp_min(1)
                 with torch.no_grad():
                     lx0, ly0 = prior.policy_logits(h, bins[..., 0])
-                lx, ly = agent.policy_logits(h, bins[..., 0])
+                lx, ly = actor.policy_logits(h, bins[..., 0])
                 kl = (F.kl_div(lx0.log_softmax(-1), lx.log_softmax(-1), log_target=True, reduction="none").sum(-1)
                       + F.kl_div(ly0.log_softmax(-1), ly.log_softmax(-1), log_target=True, reduction="none").sum(-1))
                 kl = (kl * alive).sum() / alive.sum()
-                ent = (agent.policy_entropy(h, bins) * alive).sum() / alive.sum()
+                ent = (actor.policy_entropy(h, bins) * alive).sum() / alive.sum()
                 actor_loss = pmpo + value_loss + args.kl * kl - args.entropy * ent
                 opt_actor.zero_grad(set_to_none=True); actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor_params, 1.0); opt_actor.step()
@@ -190,18 +204,20 @@ def main():
             if step % args.log_every == 0:
                 agent.eval()
                 with torch.no_grad():
-                    _, _, vstats = agent.agent_loss(val_z, val["actions"].to(dev), val["action_mask"].to(dev) > 0.5, (val["coverage"].to(dev) > 0.95).float())
+                    _, _, vstats = actor.agent_loss(val_z, val["actions"].to(dev), val["action_mask"].to(dev) > 0.5, (val["coverage"].to(dev) > 0.95).float())
                 metrics, _ = evaluate_dynamics(tok, agent, val["video"].to(dev), val_z, val["actions"].to(dev), 2)
                 agent.train()
                 log(dict(round=rnd, step=step, flow_mse=dstats["flow_mse"].item(), tape_bc_l1_px=vstats["bc_l1"].item() * 256,
                          rollout_gain_db=metrics["rollout_psnr_gain_over_floor"], rollout_latent_mse=metrics["rollout_latent_mse"], **imag), step_global)
 
         # ---- 3. evaluate in the real simulator and checkpoint
-        agent.eval()
-        g, smp = evaluate(env, tok, agent, starts, dev, args.eval_sampled, args.episode_steps)
+        actor.eval()
+        g, smp = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
         agent.train()
         cfg = torch.load(args.agent, map_location="cpu")["config"]
-        save(agent, cfg, out / f"agent_round{rnd}.pt"); save(agent, cfg, out / "agent.pt")
+        save(actor, cfg, out / f"agent_round{rnd}.pt"); save(actor, cfg, out / "agent.pt")      # the acting policy
+        if actor is not agent:
+            save(agent, cfg, out / "world_model.pt")
         log(dict(round=rnd, real_greedy=g, real_sampled=smp), step_global)
     if run is not None:
         run.finish()

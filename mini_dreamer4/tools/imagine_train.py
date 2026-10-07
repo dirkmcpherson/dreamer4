@@ -23,20 +23,24 @@ W = 10
 
 
 @torch.no_grad()
-def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature):
+def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None):
     """z_ctx (B, L, N_l, d) real latents, a_ctx (B, L-1, 2) actions taken at the first L-1 context frames.
     Returns features h (B, H, dim) of the agent token at the frames where actions are chosen, the chosen
-    action bins (B, H, 2), success probabilities p (B, H) of the frames reached, and the first-frame baseline."""
+    action bins (B, H, 2), success probabilities p (B, H) of the frames reached, and the first-frame baseline.
+    ``agent`` supplies the imagined transitions and the success reward; ``actor`` (default: ``agent``) supplies
+    the features the policy reads and the policy itself, so the actor can sit on a frozen trunk while the
+    world model keeps training."""
+    actor = agent if actor is None else actor
     b, dev = z_ctx.shape[0], z_ctx.device
     z, acts = z_ctx, a_ctx
     feats, bins, probs = [], [], []
     for t in range(horizon):
         zw = z[:, -W:]
         aw = torch.cat((acts[:, acts.shape[1] - (zw.shape[1] - 1):] if zw.shape[1] > 1 else acts[:, :0], torch.zeros(b, 1, 2, device=dev)), dim=1)
-        h = agent.agent_features(zw, aw)[:, -1]
-        lx = agent.pi_first(h); ax = torch.distributions.Categorical(logits=lx / temperature).sample()
-        ly = agent.pi_second(h + agent.bin_embed(ax)); ay = torch.distributions.Categorical(logits=ly / temperature).sample()
-        a_bins = torch.stack((ax, ay), -1); a = agent.from_bins(a_bins)
+        h = actor.agent_features(zw, aw)[:, -1]
+        lx = actor.pi_first(h); ax = torch.distributions.Categorical(logits=lx / temperature).sample()
+        ly = actor.pi_second(h + actor.bin_embed(ax)); ay = torch.distributions.Categorical(logits=ly / temperature).sample()
+        a_bins = torch.stack((ax, ay), -1); a = actor.from_bins(a_bins)
         acts = torch.cat((acts, a[:, None]), dim=1)
         ctx = z[:, -(W - 1):]
         a_in = torch.cat((acts[:, acts.shape[1] - ctx.shape[1]:], torch.zeros(b, 1, 2, device=dev)), dim=1)
@@ -44,8 +48,9 @@ def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature):
         z = torch.cat((z, nxt), dim=1)
         zw = z[:, -W:]
         aw = torch.cat((acts[:, acts.shape[1] - (zw.shape[1] - 1):], torch.zeros(b, 1, 2, device=dev)), dim=1)
-        h_next = agent.agent_features(zw, aw)[:, -1]
-        probs.append(torch.sigmoid(agent.reward_head(h_next).squeeze(-1)))
+        h_next = actor.agent_features(zw, aw)[:, -1]
+        h_rew = h_next if actor is agent else agent.agent_features(zw, aw)[:, -1]
+        probs.append(torch.sigmoid(agent.reward_head(h_rew).squeeze(-1)))
         feats.append(h); bins.append(a_bins)
     return torch.stack(feats, 1), torch.stack(bins, 1), torch.stack(probs, 1), h_next
 
