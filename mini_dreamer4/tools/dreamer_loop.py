@@ -93,6 +93,8 @@ def main():
     p.add_argument("--actor-lr", type=float, default=1e-4)
     p.add_argument("--frozen-actor-trunk", action="store_true",
                    help="policy/value heads read features from a frozen copy of the initial trunk; the live world model only supplies imagined transitions and the success reward")
+    p.add_argument("--adv-min", type=float, default=0.0, help="PMPO ignores steps whose |advantage| is below this (noise gate)")
+    p.add_argument("--anchor-best", action="store_true", help="move the KL anchor to the policy with the best real sampled success so far instead of the initial prior")
     p.add_argument("--eval-sampled", type=int, default=10)
     p.add_argument("--log-every", type=int, default=250)
     p.add_argument("--seed", type=int, default=0)
@@ -141,6 +143,7 @@ def main():
 
     g, smp = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
     log(dict(round=0, real_greedy=g, real_sampled=smp), step_global)
+    best_smp, best_round = smp, 0
     for rnd in range(1, args.rounds + 1):
         # ---- 1. collect with the current policy
         actor.eval()
@@ -174,8 +177,10 @@ def main():
             imag = {}
             if step % args.imag_every == 0:
                 agent.eval()                                        # imagined rollouts from the real prefixes of this batch
-                L = int(np.random.randint(1, 5)); nb = min(args.imag_batch, z.shape[0])
-                h, bins, p_succ, h_last = imagine(tok, agent, z[:nb, :L], actions[:nb, :L - 1], args.horizon, 1.0, actor=actor)
+                L = int(np.random.randint(1, 5))
+                reps = -(-args.imag_batch // z.shape[0])            # several imagined rollouts per real prefix when imag_batch > batch_size
+                z_ctx, a_ctx = z[:, :L].repeat(reps, 1, 1, 1)[:args.imag_batch], actions[:, :L - 1].repeat(reps, 1, 1)[:args.imag_batch]
+                h, bins, p_succ, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor)
                 agent.train()
                 success = (p_succ > 0.5).float()
                 alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)
@@ -187,7 +192,7 @@ def main():
                 value_loss = ((v - R.detach()) ** 2 * alive).sum() / alive.sum()
                 adv = (R - v).detach()
                 logp = actor.policy_log_prob(h, bins)
-                pos, neg = ((adv > 0) & (alive > 0)).float(), ((adv < 0) & (alive > 0)).float()
+                pos, neg = ((adv > args.adv_min) & (alive > 0)).float(), ((adv < -args.adv_min) & (alive > 0)).float()
                 pmpo = -(1 - args.alpha) * (logp * pos).sum() / pos.sum().clamp_min(1) + args.alpha * (logp * neg).sum() / neg.sum().clamp_min(1)
                 with torch.no_grad():
                     lx0, ly0 = prior.policy_logits(h, bins[..., 0])
@@ -218,7 +223,14 @@ def main():
         save(actor, cfg, out / f"agent_round{rnd}.pt"); save(actor, cfg, out / "agent.pt")      # the acting policy
         if actor is not agent:
             save(agent, cfg, out / "world_model.pt")
-        log(dict(round=rnd, real_greedy=g, real_sampled=smp), step_global)
+        if smp > best_smp:                                                                         # best by real evaluation
+            best_smp, best_round = smp, rnd
+            save(actor, cfg, out / "best.pt")
+            if args.anchor_best:
+                prior = copy.deepcopy(actor).eval()
+                for q in prior.parameters():
+                    q.requires_grad_(False)
+        log(dict(round=rnd, real_greedy=g, real_sampled=smp, best_sampled=best_smp, best_round=best_round), step_global)
     if run is not None:
         run.finish()
 

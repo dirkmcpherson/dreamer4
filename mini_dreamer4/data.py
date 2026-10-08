@@ -139,12 +139,16 @@ def load_pusht_npz(path: str | Path, background: str | None = None, success_thre
 def load_pusht(paths: str | Path, background: str | None = None) -> list[dict]:
     """One or several (comma-separated) PushT datasets: ``.zarr`` (human demos) or ``.npz`` (rendered tapes).
     A ``:nobc`` suffix on a path keeps that dataset out of behaviour cloning (it still trains the dynamics and
-    the success head), e.g. ``tapes.npz,onpolicy.npz:nobc``."""
+    the success head), e.g. ``tapes.npz,onpolicy.npz:nobc``. An ``:everyK`` suffix keeps every K-th episode
+    only (``tapes.npz:every10,tapes.npz:nobc`` clones from a tenth of the tapes but models all of them)."""
     episodes = []
     for spec in str(paths).split(","):
         path, *flags = spec.split(":")
         loader = load_pusht_npz if path.endswith(".npz") else load_pusht_zarr
         eps = loader(path, background=background)
+        for f in flags:
+            if f.startswith("every"):
+                eps = eps[::int(f[5:])]
         if "nobc" in flags:
             for e in eps:
                 e["action_mask"] = np.zeros(len(e["video"]), dtype=bool)

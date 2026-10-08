@@ -270,6 +270,12 @@ def train_agent(args):
         dyn = ShortcutDynamics(**cfg).to(device)
         missing = dyn.load_state_dict(init["state_dict"], strict=False)
         print(f"initialised from {args.dynamics}; new parameter groups: {sorted({k.split('.')[0] for k in missing.missing_keys})}", flush=True)
+        if args.reset_heads:                           # keep the world model, clone the policy afresh
+            for m in list(dyn.policy_heads()) + [dyn.value_head]:
+                for sub in m.modules():
+                    if hasattr(sub, "reset_parameters"):
+                        sub.reset_parameters()
+            print("policy and value heads re-initialised", flush=True)
     log = Logger(args, cfg)
     opt = torch.optim.AdamW(dyn.parameters(), lr=args.lr, weight_decay=0.01)
     lr_at = lambda s: min(1.0, (s + 1) / 500) * (0.5 * (1 + math.cos(math.pi * min(1.0, s / args.steps))) * 0.98 + 0.02)
@@ -391,6 +397,7 @@ def main():
     a.add_argument("--bc-weight", type=float, default=1.0)
     a.add_argument("--reward-weight", type=float, default=0.3)
     a.add_argument("--success-threshold", type=float, default=0.95, help="a frame is a success when its coverage exceeds this")
+    a.add_argument("--reset-heads", action="store_true", help="re-initialise the policy/value heads of the loaded checkpoint (world model kept)")
 
     r = sub.add_parser("rollout", parents=[common])
     r.add_argument("--tokenizer", required=True)
