@@ -103,6 +103,14 @@ def main():
                    help="policy/value heads read features from a frozen copy of the initial trunk; the live world model only supplies imagined transitions and the success reward")
     p.add_argument("--adv-min", type=float, default=0.0, help="PMPO ignores steps whose |advantage| is below this (noise gate)")
     p.add_argument("--anchor-best", action="store_true", help="move the KL anchor to the policy with the best real sampled success so far instead of the initial prior")
+    p.add_argument("--regime", choices=["d4", "v3"], default="d4",
+                   help="d4: Dreamer 4 imagination phase (PMPO, KL to the BC prior, actor every --imag-every steps). "
+                        "v3: DreamerV3 regime (live trunk, actor+critic every step from several prefixes of every batch, "
+                        "REINFORCE with percentile-normalised returns + entropy, EMA critic target, no KL, no cloning)")
+    p.add_argument("--imag-prefixes", type=int, default=2, help="v3: number of distinct prefix lengths per update; each gives batch_size imagined rollouts")
+    p.add_argument("--imag-steps", type=int, default=4, help="shortcut sampling steps per imagined frame (1 is cheapest)")
+    p.add_argument("--critic-ema", type=float, default=0.02, help="v3: EMA rate of the critic target")
+    p.add_argument("--reset-heads", action="store_true", help="re-initialise the policy and value heads (no behaviour cloning at all; demos only in replay)")
     p.add_argument("--eval-sampled", type=int, default=10)
     p.add_argument("--log-every", type=int, default=250)
     p.add_argument("--seed", type=int, default=0)
@@ -113,6 +121,13 @@ def main():
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     tok, agent = load_tokenizer(args.tokenizer, dev), load_dynamics(args.agent, dev)
+    if args.reset_heads:
+        for m in list(agent.policy_heads()) + [agent.value_head]:
+            for sub in m.modules():
+                if hasattr(sub, "reset_parameters"):
+                    sub.reset_parameters()
+    if args.regime == "v3":                                  # DreamerV3: actor reads the live trunk and trains every step
+        args.frozen_actor_trunk, args.imag_every = False, 1
     agent.train()
     prior = copy.deepcopy(agent).eval()
     for q in prior.parameters():
@@ -132,6 +147,10 @@ def main():
     model_params = [q for q in agent.parameters() if id(q) not in head_ids]
     opt_model = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=0.01)
     opt_actor = torch.optim.Adam(actor_params, lr=args.actor_lr)
+    critic_target = copy.deepcopy(actor.value_head).eval()      # v3: slow critic for bootstrapping
+    for q in critic_target.parameters():
+        q.requires_grad_(False)
+    ret_scale = None                                             # v3: EMA of the 5-95 percentile range of returns
     run = None
     if args.wandb:
         import wandb
@@ -185,24 +204,29 @@ def main():
                 opt_actor.step()                                    # the BC anchor also moves the policy heads (with weight 0 the heads' grads are zero and an Adam step would only replay momentum)
             imag = {}
             if step % args.imag_every == 0:
-                agent.eval()                                        # imagined rollouts from the real prefixes of this batch
-                L = int(np.random.randint(1, 5))
-                reps = -(-args.imag_batch // z.shape[0])            # several imagined rollouts per real prefix when imag_batch > batch_size
-                z_ctx, a_ctx = z[:, :L].repeat(reps, 1, 1, 1)[:args.imag_batch], actions[:, :L - 1].repeat(reps, 1, 1)[:args.imag_batch]
-                h, bins, p_succ, p_cov, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor)
+                agent.eval()                                        # imagined rollouts from real prefixes of this batch
+                T = z.shape[1]
+                if args.regime == "v3":                             # several prefix lengths -> many distinct start states
+                    outs = [imagine(tok, agent, z[:, :L], actions[:, :L - 1], args.horizon, 1.0, actor=actor, num_steps=args.imag_steps)
+                            for L in np.random.choice(np.arange(1, T + 1), size=min(args.imag_prefixes, T), replace=False)]
+                    h, bins, p_succ, p_cov, h_last = (torch.cat(x, 0) for x in zip(*outs))
+                else:
+                    L = int(np.random.randint(1, 5))
+                    reps = -(-args.imag_batch // z.shape[0])        # several imagined rollouts per real prefix when imag_batch > batch_size
+                    z_ctx, a_ctx = z[:, :L].repeat(reps, 1, 1, 1)[:args.imag_batch], actions[:, :L - 1].repeat(reps, 1, 1)[:args.imag_batch]
+                    h, bins, p_succ, p_cov, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor, num_steps=args.imag_steps)
                 agent.train()
                 success = (p_succ > 0.5).float()
                 alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)
                 reward, cont = p_succ * alive, (1 - success) * alive
+                vsrc = critic_target if args.regime == "v3" else actor.value_head
                 with torch.no_grad():
-                    v_next = torch.cat((actor.value_head(h[:, 1:]).squeeze(-1), actor.value_head(h_last).squeeze(-1)[:, None]), 1)
+                    v_next = torch.cat((vsrc(h[:, 1:]).squeeze(-1), vsrc(h_last).squeeze(-1)[:, None]), 1)
                 R = lambda_returns(reward, cont, v_next, args.gamma, args.lam)
                 v = actor.value_head(h).squeeze(-1)
                 value_loss = ((v - R.detach()) ** 2 * alive).sum() / alive.sum()
                 adv = (R - v).detach()
                 logp = actor.policy_log_prob(h, bins)
-                pos, neg = ((adv > args.adv_min) & (alive > 0)).float(), ((adv < -args.adv_min) & (alive > 0)).float()
-                pmpo = -(1 - args.alpha) * (logp * pos).sum() / pos.sum().clamp_min(1) + args.alpha * (logp * neg).sum() / neg.sum().clamp_min(1)
                 with torch.no_grad():
                     lx0, ly0 = prior.policy_logits(h, bins[..., 0])
                 lx, ly = actor.policy_logits(h, bins[..., 0])
@@ -210,13 +234,28 @@ def main():
                       + F.kl_div(ly0.log_softmax(-1), ly.log_softmax(-1), log_target=True, reduction="none").sum(-1))
                 kl = (kl * alive).sum() / alive.sum()
                 ent = (actor.policy_entropy(h, bins) * alive).sum() / alive.sum()
-                actor_loss = pmpo + value_loss + args.kl * kl - args.entropy * ent
+                if args.regime == "v3":                             # REINFORCE with percentile-normalised returns, entropy bonus, no prior
+                    live = R.detach()[alive > 0]
+                    rng = (torch.quantile(live, 0.95) - torch.quantile(live, 0.05)).item() if live.numel() > 1 else 0.0
+                    ret_scale = rng if ret_scale is None else 0.99 * ret_scale + 0.01 * rng
+                    adv_n = adv / max(1.0, ret_scale)
+                    pg = -(logp * adv_n * alive).sum() / alive.sum()
+                    actor_loss = pg + value_loss - args.entropy * ent
+                else:                                               # Dreamer 4: PMPO + KL to the cloned prior
+                    pos, neg = ((adv > args.adv_min) & (alive > 0)).float(), ((adv < -args.adv_min) & (alive > 0)).float()
+                    pg = -(1 - args.alpha) * (logp * pos).sum() / pos.sum().clamp_min(1) + args.alpha * (logp * neg).sum() / neg.sum().clamp_min(1)
+                    actor_loss = pg + value_loss + args.kl * kl - args.entropy * ent
                 opt_actor.zero_grad(set_to_none=True); actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor_params, 1.0); opt_actor.step()
+                if args.regime == "v3":
+                    with torch.no_grad():
+                        for qt, q in zip(critic_target.parameters(), actor.value_head.parameters()):
+                            qt.lerp_(q, args.critic_ema)
                 peak = p_cov.max(1).values                          # how close imagined rollouts get, by the diagnostic coverage head
                 imag = dict(imagined_success=success.max(1).values.mean().item(), imagined_peak_coverage=peak.mean().item(),
-                            imagined_near_miss=((peak >= 0.90) & (peak <= 0.95)).float().mean().item(),
-                            value_loss=value_loss.item(), kl_to_prior=kl.item(), entropy=ent.item())
+                            imagined_near_miss=((peak >= 0.90) & (peak <= 0.95)).float().mean().item(), imagined_return=R.mean().item(),
+                            value_loss=value_loss.item(), kl_to_prior=kl.item(), entropy=ent.item(), policy_loss=pg.item(),
+                            **({"return_scale": ret_scale} if ret_scale is not None else {}))
             step_global += 1
             if step % args.log_every == 0:
                 agent.eval()

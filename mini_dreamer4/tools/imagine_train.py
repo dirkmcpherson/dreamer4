@@ -23,7 +23,7 @@ W = 10
 
 
 @torch.no_grad()
-def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None):
+def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None, num_steps=4):
     """z_ctx (B, L, N_l, d) real latents, a_ctx (B, L-1, 2) actions taken at the first L-1 context frames.
     Returns features h (B, H, dim) of the agent token at the frames where actions are chosen, the chosen
     action bins (B, H, 2), success probabilities p (B, H) and predicted coverage c (B, H) of the frames reached,
@@ -45,7 +45,7 @@ def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None):
         acts = torch.cat((acts, a[:, None]), dim=1)
         ctx = z[:, -(W - 1):]
         a_in = torch.cat((acts[:, acts.shape[1] - ctx.shape[1]:], torch.zeros(b, 1, 2, device=dev)), dim=1)
-        nxt = agent.sample(ctx, a_in, horizon=1, num_steps=4)[:, -1:]
+        nxt = agent.sample(ctx, a_in, horizon=1, num_steps=num_steps)[:, -1:]
         z = torch.cat((z, nxt), dim=1)
         zw = z[:, -W:]
         aw = torch.cat((acts[:, acts.shape[1] - (zw.shape[1] - 1):], torch.zeros(b, 1, 2, device=dev)), dim=1)
