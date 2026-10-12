@@ -60,11 +60,19 @@ def collect(env, tok, agent, starts, dev, per_start, steps, temperature, seed):
 
 
 def evaluate(env, tok, agent, starts, dev, n_sampled, steps):
-    greedy, sampled = [], []
+    """Real-simulator evaluation. Besides success (final coverage > 0.95) this tracks how close the policy gets:
+    the mean peak coverage of the sampled episodes and the share of failures that peaked within 0.90-0.95."""
+    greedy, sampled, peaks = [], [], []
     for i, s0 in enumerate(starts):
         greedy.append(run_episode(env, tok, agent, s0, dev, steps, False, 1.0, 1)["coverage"][-1] > 0.95)
-        sampled += [run_episode(env, tok, agent, s0, dev, steps, True, 1.0, 5000 + i * 100 + k)["coverage"][-1] > 0.95 for k in range(n_sampled)]
-    return float(np.mean(greedy)), float(np.mean(sampled)) if sampled else float("nan")
+        for k in range(n_sampled):
+            cov = run_episode(env, tok, agent, s0, dev, steps, True, 1.0, 5000 + i * 100 + k)["coverage"]
+            sampled.append(cov[-1] > 0.95); peaks.append(float(cov.max()))
+    peaks = np.array(peaks) if peaks else np.array([float("nan")])
+    fails = peaks[~np.array(sampled, dtype=bool)] if sampled else peaks
+    return dict(real_greedy=float(np.mean(greedy)), real_sampled=float(np.mean(sampled)) if sampled else float("nan"),
+                real_peak_coverage=float(peaks.mean()), real_near_miss=float(((fails >= 0.90) & (fails <= 0.95)).mean()) if len(fails) else 0.0,
+                real_fail_peak_coverage=float(fails.mean()) if len(fails) else float("nan"))
 
 
 # ------------------------------------------------------------------------------------------ main loop
@@ -141,9 +149,9 @@ def main():
     log = lambda d, s: (print(f"[{time.time() - t0:.0f}s] " + " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in d.items()), flush=True),
                         run.log(d, step=s) if run is not None else None)
 
-    g, smp = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
-    log(dict(round=0, real_greedy=g, real_sampled=smp), step_global)
-    best_smp, best_round = smp, 0
+    ev = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
+    log(dict(round=0, **ev), step_global)
+    best_smp, best_round = ev["real_sampled"], 0
     for rnd in range(1, args.rounds + 1):
         # ---- 1. collect with the current policy
         actor.eval()
@@ -151,10 +159,11 @@ def main():
         agent.train()
         replay += new
         succ = float(np.mean([e["coverage"][-1] > 0.95 for e in new]))
+        collect_peak = float(np.mean([e["coverage"].max() for e in new]))
         np.savez_compressed(out / f"onpolicy_round{rnd}.npz", img=np.concatenate([e["video"] for e in new]), action=np.concatenate([e["actions"] for e in new]),
                             state=np.concatenate([e["states"] for e in new]), coverage=np.concatenate([e["coverage"] for e in new]),
                             episode_ends=np.cumsum([len(e["video"]) for e in new]).astype(np.int64))
-        log(dict(round=rnd, collected=len(new), collect_success=succ, replay_episodes=len(tapes) + len(replay)), step_global)
+        log(dict(round=rnd, collected=len(new), collect_success=succ, collect_peak_coverage=collect_peak, replay_episodes=len(tapes) + len(replay)), step_global)
 
         # ---- 2. train world model + actor-critic together
         ds = EpisodeWindowDataset(tapes + replay, args.seq_len, 96, samples_per_epoch=args.model_steps * args.batch_size, seed=args.seed * 100 + rnd,
@@ -166,7 +175,7 @@ def main():
             with torch.no_grad():
                 z = tok.encode(batch["video"].to(dev))
             dyn_loss, dstats = agent(z, actions)
-            bc, rew, astats = agent.agent_loss(z, actions, batch["action_mask"].to(dev) > 0.5, (batch["coverage"].to(dev) > 0.95).float())
+            bc, rew, astats = agent.agent_loss(z, actions, batch["action_mask"].to(dev) > 0.5, (batch["coverage"].to(dev) > 0.95).float(), batch["coverage"].to(dev))
             loss = dyn_loss + args.bc_weight * agent.bc_norm(bc) + args.reward_weight * agent.rew_norm(rew)
             opt_model.zero_grad(set_to_none=True); opt_actor.zero_grad(set_to_none=True)
             loss.backward()
@@ -180,7 +189,7 @@ def main():
                 L = int(np.random.randint(1, 5))
                 reps = -(-args.imag_batch // z.shape[0])            # several imagined rollouts per real prefix when imag_batch > batch_size
                 z_ctx, a_ctx = z[:, :L].repeat(reps, 1, 1, 1)[:args.imag_batch], actions[:, :L - 1].repeat(reps, 1, 1)[:args.imag_batch]
-                h, bins, p_succ, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor)
+                h, bins, p_succ, p_cov, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor)
                 agent.train()
                 success = (p_succ > 0.5).float()
                 alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)
@@ -204,20 +213,25 @@ def main():
                 actor_loss = pmpo + value_loss + args.kl * kl - args.entropy * ent
                 opt_actor.zero_grad(set_to_none=True); actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor_params, 1.0); opt_actor.step()
-                imag = dict(imagined_success=success.max(1).values.mean().item(), value_loss=value_loss.item(), kl_to_prior=kl.item(), entropy=ent.item())
+                peak = p_cov.max(1).values                          # how close imagined rollouts get, by the diagnostic coverage head
+                imag = dict(imagined_success=success.max(1).values.mean().item(), imagined_peak_coverage=peak.mean().item(),
+                            imagined_near_miss=((peak >= 0.90) & (peak <= 0.95)).float().mean().item(),
+                            value_loss=value_loss.item(), kl_to_prior=kl.item(), entropy=ent.item())
             step_global += 1
             if step % args.log_every == 0:
                 agent.eval()
                 with torch.no_grad():
                     _, _, vstats = actor.agent_loss(val_z, val["actions"].to(dev), val["action_mask"].to(dev) > 0.5, (val["coverage"].to(dev) > 0.95).float())
+                    _, _, wstats = agent.agent_loss(val_z, val["actions"].to(dev), val["action_mask"].to(dev) > 0.5, (val["coverage"].to(dev) > 0.95).float(), val["coverage"].to(dev))
                 metrics, _ = evaluate_dynamics(tok, agent, val["video"].to(dev), val_z, val["actions"].to(dev), 2)
                 agent.train()
-                log(dict(round=rnd, step=step, flow_mse=dstats["flow_mse"].item(), tape_bc_l1_px=vstats["bc_l1"].item() * 256,
+                log(dict(round=rnd, step=step, flow_mse=dstats["flow_mse"].item(), tape_bc_l1_px=vstats["bc_l1"].item() * 256, coverage_mae=wstats["coverage_mae"].item(),
                          rollout_gain_db=metrics["rollout_psnr_gain_over_floor"], rollout_latent_mse=metrics["rollout_latent_mse"], **imag), step_global)
 
         # ---- 3. evaluate in the real simulator and checkpoint
         actor.eval()
-        g, smp = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
+        ev = evaluate(env, tok, actor, starts, dev, args.eval_sampled, args.episode_steps)
+        smp = ev["real_sampled"]
         agent.train()
         cfg = torch.load(args.agent, map_location="cpu")["config"]
         save(actor, cfg, out / f"agent_round{rnd}.pt"); save(actor, cfg, out / "agent.pt")      # the acting policy
@@ -230,7 +244,7 @@ def main():
                 prior = copy.deepcopy(actor).eval()
                 for q in prior.parameters():
                     q.requires_grad_(False)
-        log(dict(round=rnd, real_greedy=g, real_sampled=smp, best_sampled=best_smp, best_round=best_round), step_global)
+        log(dict(round=rnd, **ev, best_sampled=best_smp, best_round=best_round), step_global)
     if run is not None:
         run.finish()
 

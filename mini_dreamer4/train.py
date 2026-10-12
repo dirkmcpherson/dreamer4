@@ -54,7 +54,7 @@ def load_dynamics(path: str, device) -> ShortcutDynamics:
     dyn = ShortcutDynamics(**ckpt["config"]).to(device)
     result = dyn.load_state_dict(ckpt["state_dict"], strict=False)
     # heads added after a checkpoint was written (e.g. the value head) start fresh; anything else must match
-    assert not result.unexpected_keys and all(k.startswith("value_head.") for k in result.missing_keys), result
+    assert not result.unexpected_keys and all(k.split(".")[0] in ("value_head", "coverage_head") for k in result.missing_keys), result
     return dyn.eval()
 
 
@@ -290,7 +290,7 @@ def train_agent(args):
         if args.dyn_weight == 0:
             dyn_loss = dyn_loss.detach() * 0           # control: no dynamics gradient at all
         bc, rew, astats = dyn.agent_loss(z, actions, batch["action_mask"].to(device) > 0.5,
-                                         (batch["coverage"].to(device) > args.success_threshold).float())
+                                         (batch["coverage"].to(device) > args.success_threshold).float(), batch["coverage"].to(device))
         loss = dyn_loss + args.bc_weight * dyn.bc_norm(bc) + args.reward_weight * dyn.rew_norm(rew)
         opt.zero_grad(set_to_none=True)
         loss.backward()

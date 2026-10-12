@@ -111,6 +111,7 @@ class ShortcutDynamics(nn.Module):
             self.pi_second = head(action_bins)                # p(a_y | h, a_x): the two dimensions are not independent
             self.reward_head = head(1)                        # logit of "this frame is a success"
             self.value_head = head(1)                         # expected discounted success from this frame (imagination training)
+            self.coverage_head = head(1)                      # predicted geometric coverage of this frame (diagnostic only, never a reward)
             s = 2 + num_registers + self.n_spatial + 1
             allowed = torch.ones(s, s, dtype=torch.bool)
             allowed[:-1, -1] = False
@@ -171,9 +172,11 @@ class ShortcutDynamics(nn.Module):
         step = torch.full((b, t), self.max_exp, dtype=torch.long, device=z.device)
         return self.predict(z, sig, step, prev, valid, return_agent=True)[1]
 
-    def agent_loss(self, z: Tensor, actions: Tensor, action_mask: Tensor, success: Tensor | None = None) -> tuple[Tensor, Tensor, dict]:
-        """Behaviour cloning (and success prediction) from the agent token. actions (B, T, 2) taken at frame t;
-        action_mask (B, T) False where no action was taken (last frame of an episode); success (B, T) in {0, 1}."""
+    def agent_loss(self, z: Tensor, actions: Tensor, action_mask: Tensor, success: Tensor | None = None,
+                   coverage: Tensor | None = None) -> tuple[Tensor, Tensor, dict]:
+        """Behaviour cloning (and success / coverage prediction) from the agent token. actions (B, T, 2) taken at frame t;
+        action_mask (B, T) False where no action was taken (last frame of an episode); success (B, T) in {0, 1};
+        coverage (B, T) in [0, 1] trains the diagnostic coverage head (folded into the returned reward loss)."""
         h = self.agent_features(z, actions)
         target = self.to_bins(actions)
         logit_x = self.pi_first(h)
@@ -193,6 +196,10 @@ class ShortcutDynamics(nn.Module):
             rl = self.reward_head(h).squeeze(-1)
             rew = F.binary_cross_entropy_with_logits(rl, success.float())
             stats["success_acc"] = ((rl > 0) == (success > 0.5)).float().mean()
+        if coverage is not None:
+            cp = self.coverage_head(h).squeeze(-1)
+            rew = rew + F.mse_loss(cp, coverage.float())
+            stats["coverage_mae"] = (cp - coverage.float()).abs().mean().detach()
         return bc, rew, stats
 
     # ------------------------------------------------------------------ policy distribution utilities (imagination training)
