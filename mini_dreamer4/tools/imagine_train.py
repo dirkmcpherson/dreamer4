@@ -27,7 +27,7 @@ def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None, num_step
     """z_ctx (B, L, N_l, d) real latents, a_ctx (B, L-1, 2) actions taken at the first L-1 context frames.
     Returns features h (B, H, dim) of the agent token at the frames where actions are chosen, the chosen
     action bins (B, H, 2), success probabilities p (B, H) and predicted coverage c (B, H) of the frames reached,
-    and the features of the last frame.
+    the features of the last frame, and the predicted coverage c0 (B,) of the last context frame.
     ``agent`` supplies the imagined transitions and the success reward; ``actor`` (default: ``agent``) supplies
     the features the policy reads and the policy itself, so the actor can sit on a frozen trunk while the
     world model keeps training."""
@@ -35,6 +35,9 @@ def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None, num_step
     b, dev = z_ctx.shape[0], z_ctx.device
     z, acts = z_ctx, a_ctx
     feats, bins, probs, covs = [], [], [], []
+    zw = z[:, -W:]
+    aw = torch.cat((acts[:, acts.shape[1] - (zw.shape[1] - 1):] if zw.shape[1] > 1 else acts[:, :0], torch.zeros(b, 1, 2, device=dev)), dim=1)
+    c0 = agent.coverage_head(agent.agent_features(zw, aw)[:, -1]).squeeze(-1)      # predicted coverage of the last context frame
     for t in range(horizon):
         zw = z[:, -W:]
         aw = torch.cat((acts[:, acts.shape[1] - (zw.shape[1] - 1):] if zw.shape[1] > 1 else acts[:, :0], torch.zeros(b, 1, 2, device=dev)), dim=1)
@@ -54,7 +57,7 @@ def imagine(tok, agent, z_ctx, a_ctx, horizon, temperature, actor=None, num_step
         probs.append(torch.sigmoid(agent.reward_head(h_rew).squeeze(-1)))
         covs.append(agent.coverage_head(h_rew).squeeze(-1))
         feats.append(h); bins.append(a_bins)
-    return torch.stack(feats, 1), torch.stack(bins, 1), torch.stack(probs, 1), torch.stack(covs, 1), h_next
+    return torch.stack(feats, 1), torch.stack(bins, 1), torch.stack(probs, 1), torch.stack(covs, 1), h_next, c0
 
 
 def lambda_returns(reward, cont, value_next, gamma, lam):
@@ -134,7 +137,7 @@ def main():
                 zs = zs.expand(-1, L, -1, -1)
             z_ctx = torch.cat((z_ctx, zs)); a_ctx = torch.cat((a_ctx, torch.zeros(n_start, L - 1, 2, device=dev)))
         # ---- imagine with the current policy (no gradients)
-        h, bins, p_succ, _, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, args.temperature)
+        h, bins, p_succ, _, h_last, _ = imagine(tok, agent, z_ctx, a_ctx, args.horizon, args.temperature)
         success = (p_succ > 0.5).float()
         alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)   # 1 until the step after success
         reward = p_succ * alive

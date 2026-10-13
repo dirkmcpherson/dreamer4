@@ -110,6 +110,9 @@ def main():
     p.add_argument("--imag-prefixes", type=int, default=2, help="v3: number of distinct prefix lengths per update; each gives batch_size imagined rollouts")
     p.add_argument("--imag-steps", type=int, default=4, help="shortcut sampling steps per imagined frame (1 is cheapest)")
     p.add_argument("--critic-ema", type=float, default=0.02, help="v3: EMA rate of the critic target")
+    p.add_argument("--cov-reward", type=float, default=0.0,
+                   help="imagination only: weight of a potential-based shaping reward on the coverage head's prediction between --cov-floor and 0.95 (the real task stays sparse)")
+    p.add_argument("--cov-floor", type=float, default=0.9)
     p.add_argument("--reset-heads", action="store_true", help="re-initialise the policy and value heads (no behaviour cloning at all; demos only in replay)")
     p.add_argument("--eval-sampled", type=int, default=10)
     p.add_argument("--log-every", type=int, default=250)
@@ -209,16 +212,21 @@ def main():
                 if args.regime == "v3":                             # several prefix lengths -> many distinct start states
                     outs = [imagine(tok, agent, z[:, :L], actions[:, :L - 1], args.horizon, 1.0, actor=actor, num_steps=args.imag_steps)
                             for L in np.random.choice(np.arange(1, T + 1), size=min(args.imag_prefixes, T), replace=False)]
-                    h, bins, p_succ, p_cov, h_last = (torch.cat(x, 0) for x in zip(*outs))
+                    h, bins, p_succ, p_cov, h_last, c0 = (torch.cat(x, 0) for x in zip(*outs))
                 else:
                     L = int(np.random.randint(1, 5))
                     reps = -(-args.imag_batch // z.shape[0])        # several imagined rollouts per real prefix when imag_batch > batch_size
                     z_ctx, a_ctx = z[:, :L].repeat(reps, 1, 1, 1)[:args.imag_batch], actions[:, :L - 1].repeat(reps, 1, 1)[:args.imag_batch]
-                    h, bins, p_succ, p_cov, h_last = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor, num_steps=args.imag_steps)
+                    h, bins, p_succ, p_cov, h_last, c0 = imagine(tok, agent, z_ctx, a_ctx, args.horizon, 1.0, actor=actor, num_steps=args.imag_steps)
                 agent.train()
                 success = (p_succ > 0.5).float()
                 alive = torch.cumprod(torch.cat((torch.ones_like(success[:, :1]), 1 - success[:, :-1]), 1), 1)
                 reward, cont = p_succ * alive, (1 - success) * alive
+                shaping = torch.zeros(())
+                if args.cov_reward > 0:                             # potential-based shaping on predicted coverage inside [cov_floor, 0.95]:
+                    phi = lambda c: args.cov_reward * (c - args.cov_floor).clamp(0, 0.95 - args.cov_floor) / (0.95 - args.cov_floor)
+                    shaping = (phi(p_cov) - phi(torch.cat((c0[:, None], p_cov[:, :-1]), 1))) * alive   # sums to cov_reward from below the floor to the threshold; hovering earns nothing
+                    reward = reward + shaping
                 vsrc = critic_target if args.regime == "v3" else actor.value_head
                 with torch.no_grad():
                     v_next = torch.cat((vsrc(h[:, 1:]).squeeze(-1), vsrc(h_last).squeeze(-1)[:, None]), 1)
@@ -255,6 +263,7 @@ def main():
                 imag = dict(imagined_success=success.max(1).values.mean().item(), imagined_peak_coverage=peak.mean().item(),
                             imagined_near_miss=((peak >= 0.90) & (peak <= 0.95)).float().mean().item(), imagined_return=R.mean().item(),
                             value_loss=value_loss.item(), kl_to_prior=kl.item(), entropy=ent.item(), policy_loss=pg.item(),
+                            shaping_reward=shaping.sum(-1).mean().item() if shaping.dim() else 0.0,
                             **({"return_scale": ret_scale} if ret_scale is not None else {}))
             step_global += 1
             if step % args.log_every == 0:
